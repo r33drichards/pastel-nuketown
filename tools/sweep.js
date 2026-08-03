@@ -134,6 +134,14 @@ function finish() {
     };
   };
   console.log(' '.repeat(30) + '\r');
+  /* Per-seed rows on request: the aggregate hides the paired structure, and
+     rounds-per-match is a far finer statistic than deaths, so it is worth
+     testing properly rather than eyeballing a column of means. */
+  if (process.env.SWEEP_JSON) {
+    const dump = {};
+    for (const arm of ARMS) dump[arm.name] = seeds.map(s => results.get(arm.name).get(s) || null);
+    require('node:fs').writeFileSync(process.env.SWEEP_JSON, JSON.stringify(dump));
+  }
   for (const arm of ARMS) {
     const s = stat(results.get(arm.name));
     const t = arm.name === 'baseline' ? null : signTest(base, results.get(arm.name), seeds);
