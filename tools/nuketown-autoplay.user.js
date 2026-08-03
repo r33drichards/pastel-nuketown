@@ -546,20 +546,23 @@ const POLICY = (() => {
     'reloadAt',      // reload when the magazine drops to this fraction
     'aimHeight',     // metres above the target's feet to aim
     'searchTurn',    // radians/second to sweep when nothing is visible
-    'coneSlack'      // multiples of the target's own angular width to fire within
+    'coneSlack',     // multiples of the target's own angular width to fire within
+    'burstOn',       // seconds of held trigger per burst (automatics only)
+    'burstOff'       // seconds off between bursts; 0 means fire continuously
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
     [0, 1], [4, 40], [0, 0.9], [0.8, 2.0], [0.5, 6],
-    [0.3, 6]
+    [0.3, 6], [0.05, 1.2], [0, 0.8]
   ];
   const P = {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
     strafePeriod: 1.1, strafeAmount: 0.8, sprintRange: 18,
-    reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0, coneSlack: 1.6
+    reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0, coneSlack: 1.6,
+    burstOn: 0.25, burstOff: 0
   };
 
-  let t = 0, strafeSign = 1, phase = 0;
+  let t = 0, strafeSign = 1, phase = 0, burstT = 0;
 
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
 
@@ -643,10 +646,29 @@ const POLICY = (() => {
       const hasAmmo = me.ammo > 0;
       if (!hasAmmo || me.ammo / w.mag <= P.reloadAt) tryReload(me);
 
+      /* Burst cadence: hold for burstOn, let go for burstOff, repeat. Only
+         automatics have anything to gain — a semi-auto already paces itself
+         off fireCd, and a burst window laid over that would just swallow
+         shots the gun was ready to take.
+
+         Note what this cannot buy in this engine: spread is `moving ?
+         spreadMove : spread` and nothing else, so the thirtieth round of a
+         held burst is as accurate as the first. What a pause does buy is a
+         look at the world between bursts — the target's death is registered
+         and the next rounds go somewhere useful rather than into a body that
+         is already down. Online that gap is a whole round trip wide.
+
+         The phase resets whenever the trigger is not wanted, so every fresh
+         engagement opens on a burst rather than partway through a pause. */
+      const wantFire = visible && onTarget && inRange && hasAmmo;
+      const cycle = P.burstOn + P.burstOff;
+      burstT = wantFire ? burstT + dt : 0;
+      const inBurst = !w.auto || P.burstOff <= 0 || (burstT % cycle) < P.burstOn;
+
       return {
         fwd, strafe,
         sprint: dist > P.sprintRange && !visible,
-        fire: visible && onTarget && inRange && hasAmmo,
+        fire: wantFire && inBurst,
         yaw, pitch
       };
     }
@@ -670,7 +692,7 @@ const POLICY = (() => {
      than silently reinterpreted — and a rejected vector means the policy runs
      on its untuned defaults, which is worth a shout rather than a shrug. */
   if (!POLICY.setParams(
-      [24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332,1.6])) {
+      [24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332,1.6,0.25,0])) {
     console.error('[auto] parameter vector rejected — the policy is running untuned');
   }
 

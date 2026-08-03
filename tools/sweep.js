@@ -22,8 +22,6 @@ const path = require('node:path');
 const { execFileSync, fork } = require('node:child_process');
 const { runMatch, userscript } = require('./eval-policy.js');
 
-const TUNED = [24.030481, 2.256479, 0.103612, 22.140736, 1.897986,
-               0.634428, 12.297849, 0.177887, 1.575976, 3.160332];
 
 /* ---- worker ---------------------------------------------------------- */
 if (process.argv[2] === '--worker') {
@@ -33,7 +31,7 @@ if (process.argv[2] === '--worker') {
     if (!msg || msg.done) { process.exit(0); }
     const r = runMatch(msg.seed, {
       src: sources[msg.arm.src],
-      params: msg.arm.params || undefined
+      overrides: msg.arm.overrides || undefined
     });
     process.send({ arm: msg.arm.name, seed: msg.seed, row: r });
   });
@@ -44,18 +42,30 @@ if (process.argv[2] === '--worker') {
 /* ---- parent ---------------------------------------------------------- */
 const SEEDS = Number(process.argv[2] || 40);
 const ROOT = path.join(__dirname, '..');
+/* Pinned, not HEAD~1: the baseline is the last commit whose fire gate was the
+   constant angle, and it stops being the previous commit the moment anything
+   else lands. A relative ref here would quietly start comparing the change
+   against itself. */
+const BASE_REF = process.argv[3] || '423a4a2';
+/* name=value,value,... e.g. coneSlack=0.6,3.5 */
+const KNOB = (process.argv[4] || 'coneSlack=0.6,3.5');
+const [KNOB_NAME, KNOB_VALUES] = KNOB.split('=');
+const VALUES = KNOB_VALUES.split(',').map(Number);
+/* `now` as the ref compares the working tree against itself with one knob
+   moved, which is what isolates a single parameter. A committed ref compares
+   against a different file, which measures the whole diff -- right for "did
+   this change help", wrong for "what should this knob be set to". */
 const sources = {
-  head: execFileSync('git', ['show', 'HEAD~1:tools/nuketown-autoplay.user.js'],
-    { cwd: ROOT, encoding: 'utf8' }),
+  head: BASE_REF === 'now' ? userscript()
+    : execFileSync('git', ['show', `${BASE_REF}:tools/nuketown-autoplay.user.js`],
+      { cwd: ROOT, encoding: 'utf8' }),
   now: userscript()
 };
 
-const ARMS = [
-  { name: 'baseline', src: 'head' },
-  { name: 'slack 0.6', src: 'now', params: TUNED.concat([0.6]) },
-  { name: 'slack 1.6', src: 'now', params: TUNED.concat([1.6]) },
-  { name: 'slack 3.5', src: 'now', params: TUNED.concat([3.5]) }
-];
+const ARMS = [{ name: 'baseline', src: 'head' }].concat(
+  VALUES.map(v => ({
+    name: `${KNOB_NAME} ${v}`, src: 'now', overrides: { [KNOB_NAME]: v }
+  })));
 
 const jobs = [];
 for (const arm of ARMS) for (let s = 1; s <= SEEDS; s++) jobs.push({ arm, seed: s });

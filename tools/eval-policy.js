@@ -95,7 +95,22 @@ function runMatch(seed, opts = {}) {
   inst.run(INSTRUMENT);
   inst.run(policySource(src));
   if (!opts.idle) inst.run(driverSource(src));     // wraps window.simulate
-  if (opts.params) inst.run(`POLICY.setParams(${JSON.stringify(opts.params)});`);
+  /* Overrides are applied BY NAME on top of whatever vector the driver just
+     installed. Passing a whole vector positionally would silently go stale
+     the moment the policy gains a parameter -- setParams would reject the
+     short vector and the arm would quietly run untuned. */
+  if (opts.overrides) {
+    inst.run(`{
+      const v = POLICY.getParams(), names = POLICY.PARAM_NAMES;
+      const o = ${JSON.stringify(opts.overrides)};
+      for (const k of Object.keys(o)) {
+        const i = names.indexOf(k);
+        if (i < 0) throw new Error('no such parameter: ' + k);
+        v[i] = o[k];
+      }
+      if (!POLICY.setParams(v)) throw new Error('setParams rejected an override vector');
+    }`);
+  }
   inst.run('startMatch();');
   inst.run(RESEED(seed));
 
