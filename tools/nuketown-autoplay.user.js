@@ -503,6 +503,14 @@ setPlayerName()
    Measured against eight LILAC bots, first to 25 kills. A normal SOLO game is
    easier than that (2 easy / 5 normal / 2 hard).
 
+   Fires in bursts: 0.25s on, 0.16s off, automatics only. Measured over 240
+   solo matches on paired seeds (tools/sweep.js) that is worth about 7% fewer
+   rounds a match -- 192 down to 179, against a magazine plus reserve of 210 --
+   and no change at all to kills or deaths, both of which stayed inside the
+   noise. It is an ammo economy, not a fitness gain: this engine has no spread
+   bloom, so a pause cannot make the next round more accurate. Set burstOff to
+   0 for continuous fire.
+
    Paste into the DevTools console on https://nuketown.luckeysystems.com/
    after starting a SOLO match, then press F9.
 
@@ -596,10 +604,13 @@ const POLICY = (() => {
 
     act(me, G, dt) {
       t += dt;
-      if (!me.alive) return null;
+      /* Both of these end an engagement, so the burst phase goes back to the
+         start: the next one opens on a burst rather than partway through a
+         pause it sat out while dead or while nobody was in sight. */
+      if (!me.alive) { burstT = 0; return null; }
 
       const { target, dist, visible } = pickTarget(me, G);
-      if (!target) return { yaw: me.yaw + P.searchTurn * dt };
+      if (!target) { burstT = 0; return { yaw: me.yaw + P.searchTurn * dt }; }
 
       /* Aim: turn toward the target, capped, so the policy cannot teleport its
          crosshair. Pitch accounts for the height difference. */
@@ -692,7 +703,7 @@ const POLICY = (() => {
      than silently reinterpreted — and a rejected vector means the policy runs
      on its untuned defaults, which is worth a shout rather than a shrug. */
   if (!POLICY.setParams(
-      [24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332,1.6,0.25,0])) {
+      [24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332,1.6,0.25,0.16])) {
     console.error('[auto] parameter vector rejected — the policy is running untuned');
   }
 
