@@ -32,8 +32,12 @@ const { fork } = require('node:child_process');
 
 const DIR = path.join(__dirname, 'strategies');
 const JOURNAL = path.join(DIR, 'results.jsonl');
-const MATCH_TIMEOUT_MS = 15 * 60 * 1000;   // a strategy that cannot finish its
-                                           // seeds in this is a failed entry
+/* Scaled to the work, not fixed. A match costs ~4.4 CPU-seconds and workers
+   contend, so a flat 15 minutes silently failed a 150-seed entry that was
+   merely slow -- which is how `cem: exit null` appeared in the first big run
+   and cost the tournament an arm. Budget 30s per seed with a 10 minute floor,
+   and a strategy that blows THAT is genuinely stuck. */
+const MATCH_TIMEOUT_MS = () => Math.max(10 * 60 * 1000, 30 * 1000 * SEEDS.length);
 
 /* ---- worker: one strategy, all seeds ---------------------------------- */
 if (process.argv[2] === '--worker') {
@@ -113,7 +117,7 @@ function launch() {
     let stderr = '';
     w.stderr.on('data', d => { stderr += d.toString(); });
     const lastLines = n => stderr.trim().split('\n').filter(Boolean).slice(-n).join(' | ');
-    const kill = setTimeout(() => { w.kill('SIGKILL'); }, MATCH_TIMEOUT_MS);
+    const kill = setTimeout(() => { w.kill('SIGKILL'); }, MATCH_TIMEOUT_MS());
     let payload = null;
     w.on('message', m => { if (m.done) payload = m; });
     w.on('exit', code => {
