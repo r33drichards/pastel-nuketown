@@ -653,55 +653,91 @@ const POLICY = (() => {
   }
   POLICY.setParams([24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332]);
 
-  /* This vector was tuned for the smg, so that stays the first choice and is
-     equipped through the game's own weapon switch — the same call the number
-     keys make. But nothing refills ammo mid-life: the smg carries 30 in the
-     magazine and 180 in reserve, and a long streak spends all 210. When the
-     gun in your hands has no rounds left anywhere, reloading is a no-op and
-     the bot stands there dry until something kills it. So fall back to the
-     next weapon that still has rounds, and go back to the smg after the
-     respawn that refills it. Re-checked each tick for the same reason. */
-  const WANT = ["smg", "rifle", "shotgun"];
+  /* ---- the arsenal ----------------------------------------------------
+     The vector was tuned for the smg, so that stays the first choice. But
+     nothing refills ammo mid-life: 30 in the magazine and 180 in reserve is
+     all a life gets, and a long streak spends it. Once the gun in your hands
+     is empty everywhere, reloading is a no-op and the bot stands there with a
+     dead trigger until something kills it. So the tick asks the arsenal for
+     the first gun that still has rounds, and the respawn refill puts the smg
+     back at the head of the queue.
 
-  /* Rounds available on a weapon, held or not. The ones you are not holding
-     keep theirs in the per-weapon store; a weapon missing from the store has
-     never been touched, which switchWeapon treats as a full loadout. */
-  function ammoFor(id) {
-    const p = G.player, w = WBY[id];
-    if (!p || !w) return 0;
-    if (p.weapon === id) return (p.ammo || 0) + (p.reserve || 0);
-    const held = p._ammoBy && p._ammoBy[id];
-    return held ? (held.ammo || 0) + (held.reserve || 0) : w.mag + w.reserve;
-  }
-
-  function ensureWeapon() {
-    if (typeof switchWeapon !== 'function' || !G.player) return;
-    if (G.player.reloadT > 0) return;          // a swap would eat the reload
-    const want = WANT.find(id => ammoFor(id) > 0);
-    if (!want || want === G.player.weapon) return;   // all dry: keep what we hold
-    try { switchWeapon(want); } catch (e) {}
-  }
-
-  /* The rifle and the shotgun are semi-automatic: the sim latches _heldSemi
-     after a shot and will not fire again until `firing` has gone false for a
-     tick. Holding the trigger down is exactly one shot a lifetime on them. So
-     let go while the shot cooldown is running — that costs no rate of fire,
-     and it re-arms the trigger for the moment the cooldown ends. Going through
-     pressFire()/releaseFire() rather than poking IN.firing also keeps fireSeq
-     ticking, which is what seeds each shot's spread. */
-  function applyFire(want) {
-    const w = WBY[G.player.weapon];
-    if (want && w && !w.auto && G.player.fireCd > 0) want = false;
-    if (typeof pressFire === 'function' && typeof releaseFire === 'function') {
-      if (want) pressFire(); else releaseFire();
-    } else {
-      IN.firing = want;
+     Each gun is an object that answers for itself. The smg is automatic and
+     the other two are not, and that difference decides how the trigger has to
+     be driven — so it lives in the class rather than in a branch the firing
+     code re-asks every tick. */
+  class Weapon {
+    constructor(id) {
+      this.id = id;
+      this.spec = WBY[id];
+      /* A gun absent from the loadout has never been touched, which is how
+         switchWeapon reads it too: full magazine, full reserve. */
+      this.untouched = { ammo: this.spec.mag, reserve: this.spec.reserve };
     }
+    rounds(loadout) {
+      const store = loadout[this.id] || this.untouched;
+      return store.ammo + store.reserve;
+    }
+    dry(loadout) { return this.rounds(loadout) <= 0; }
+    /* switchWeapon returns early when this gun is already in hand, so equip is
+       a no-op on every tick but the one that changes weapons. It cannot eat a
+       reload either: reloading requires reserve > 0, which is rounds to spare,
+       which means this is the gun the arsenal just picked anyway. */
+    equip() { switchWeapon(this.id); }
+    /* Whether pulling the trigger now would actually send a round. Shared by
+       both kinds: an empty magazine just makes the click noise, and the click
+       still books 0.25 s of fire cooldown. */
+    ready(me) { return me.ammo > 0; }
+    trigger(me, want) { return want && this.ready(me); }
   }
+
+  /* Hold it down: every tick the sim sees `firing`, an automatic fires again,
+     so the inherited trigger is the whole of it. */
+  class Automatic extends Weapon {}
+
+  /* Tap it. Firing is an edge for these: the sim latches _heldSemi after a
+     shot and will not fire again until `firing` has been false for a tick, so
+     a held trigger is one rifle shot a life. Letting go while the shot
+     cooldown runs costs nothing — no shot is possible during it anyway — and
+     it re-arms the trigger for the moment the cooldown ends. */
+  class SemiAutomatic extends Weapon {
+    ready(me) { return super.ready(me) && me.fireCd <= 0; }
+  }
+
+  /* Nothing left to shoot with, so the tick never has to ask whether the
+     arsenal found it a gun. */
+  const EMPTY_HANDED = {
+    rounds: () => 0, dry: () => true, equip() {}, trigger: () => false
+  };
+
+  /* The game's own `auto` flag picks the class. This is the only place the two
+     kinds of trigger are told apart. */
+  const TRIGGERS = new Map([[true, Automatic], [false, SemiAutomatic]]);
+  const ARSENAL = ['smg', 'rifle', 'shotgun']
+    .map(id => new (TRIGGERS.get(!!WBY[id].auto))(id));
+
+  /* Live rounds for the gun in your hands, the per-weapon store for the rest —
+     the store is where the game parks the ammo you are not carrying, so that a
+     swap is not a free reload. */
+  const loadoutOf = me =>
+    Object.assign({}, me._ammoBy, { [me.weapon]: { ammo: me.ammo, reserve: me.reserve } });
+  const inHand = me => ARSENAL.find(w => w.id === me.weapon) || EMPTY_HANDED;
+  const bestFor = me => {
+    const loadout = loadoutOf(me);
+    return ARSENAL.find(w => !w.dry(loadout)) || EMPTY_HANDED;
+  };
+
+  /* pressFire/releaseFire rather than poking IN.firing: they own the fireSeq
+     increment, which is what seeds each shot's spread. */
+  const FIRE = new Map([[true, () => pressFire()], [false, () => releaseFire()]]);
 
   let on = true, warned = false;
   const orig = window.simulate;
   if (typeof orig !== 'function') { console.error('[auto] window.simulate not found'); return; }
+  if (typeof switchWeapon !== 'function' || typeof pressFire !== 'function' ||
+      typeof releaseFire !== 'function') {
+    console.error('[auto] game globals missing'); return;
+  }
 
   /* Wrap the tick. The action is applied BEFORE the original runs, so the
      inputs this frame consumes are the ones the policy just chose. */
@@ -712,13 +748,13 @@ const POLICY = (() => {
         on = false;
       } else if (G.started && !G.over && !G.paused && G.player) {
         try {
-          ensureWeapon();
+          bestFor(G.player).equip();
           const a = POLICY.act(G.player, G, dt);
           if (a) {
             KEY.KeyW = a.fwd > 0; KEY.KeyS = a.fwd < 0;
             KEY.KeyD = a.strafe > 0; KEY.KeyA = a.strafe < 0;
             KEY.Space = !!a.jump; KEY.ShiftLeft = !!a.sprint;
-            applyFire(!!a.fire);
+            FIRE.get(inHand(G.player).trigger(G.player, !!a.fire))();
             if (typeof a.yaw === 'number') G.player.yaw = a.yaw;
             if (typeof a.pitch === 'number') {
               G.player.pitch = Math.max(-1.45, Math.min(1.45, a.pitch));
@@ -737,7 +773,7 @@ const POLICY = (() => {
     if (e.code !== 'F9') return;
     if (!on && !soloOnly()) { console.warn('[auto] solo bot matches only'); return; }
     on = !on;
-    if (!on) { IN.firing = false; KEY.KeyW = KEY.KeyS = KEY.KeyA = KEY.KeyD = false; }
+    if (!on) { releaseFire(); KEY.KeyW = KEY.KeyS = KEY.KeyA = KEY.KeyD = false; }
     if (on && POLICY.reset) POLICY.reset(1);
     warned = false;
     console.log('%c[auto] ' + (on ? 'ON' : 'off'), 'color:#ffd6e8;font-weight:bold');
