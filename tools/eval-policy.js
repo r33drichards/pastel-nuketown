@@ -93,7 +93,11 @@ function runMatch(seed, opts = {}) {
   inst.run(`Math.random = (${mulberry32.toString()})(${(seed >>> 0) || 1});`);
   inst.run(SIM_BOOT);
   inst.run(INSTRUMENT);
-  inst.run(policySource(src));
+  /* A strategy under test can replace the POLICY block wholesale while keeping
+     the shipped driver, so a tournament compares decision-making rather than
+     plumbing. The text must define a global POLICY with act(me, G, dt) and a
+     setParams() the driver can call harmlessly -- returning null is fine. */
+  inst.run(opts.policySource || policySource(src));
   if (!opts.idle) inst.run(driverSource(src));     // wraps window.simulate
   /* Overrides are applied BY NAME on top of whatever vector the driver just
      installed. Passing a whole vector positionally would silently go stale
