@@ -35,6 +35,16 @@
                   covered pocket and the match takes half as long again for
                   the same 25 kills — which is a straight fitness loss.
 
+   The field does not drive the whole time. `fieldAt` gates it on how many
+   enemies can see the bot right now: below the threshold the shipped
+   range-keeping body runs untouched, because the shipped body reaches 25
+   kills faster and a longer match is more chances to die. Measured over the
+   24 training seeds the always-on field is a small net LOSS (17.19 vs 17.88)
+   even though it demonstrably reduces exposure — the exposure saving is
+   spent on a match a quarter longer. Gated at two watchers it is the best
+   arm tried (18.58, 0.54 deaths against 0.71), though not by a margin the
+   sign test can see. See the sweep table at the bottom of this file.
+
    Dithering is handled in three explicit places, not by luck:
      1. the field is recomputed at RECOMPUTE_TICKS, not every tick;
      2. a chosen goal is held for commitTime seconds regardless;
@@ -92,7 +102,7 @@ const POLICY = (() => {
     /* ---- FIELD WEIGHTS ---- */
     wThreat: 9.0, threatExp: 1.75, wCover: 3.0, wOpp: 7.0, wTravel: 0.45,
     threatDecay: 22.0, oppBand: 9.0, wPress: 0.60, switchMargin: 1.5,
-    commitTime: 0.55, hurtBoost: 1.0, shieldHold: 0, fieldAt: 0
+    commitTime: 0.55, hurtBoost: 1.0, shieldHold: 0, fieldAt: 2
   };
 
   /* ---- structural constants: shape of the search, not tuning knobs ---- */
@@ -541,6 +551,36 @@ const POLICY = (() => {
   };
 })();
 `;
+
+/* ---------------------------------------------------------------------
+   MEASURED, 24 training seeds (1-24), paired against the shipped policy.
+   Sign test is two-sided over non-tied seeds.
+
+     arm                       fitness  deaths  perfect  secs   W/L/T     p
+     shipped                    17.882    0.71    12/24   42s      -      -
+     field always on (fieldAt 0) 17.187   0.83    12/24   53s   5/9/10  0.424
+     fieldAt 1                   18.229   0.63    12/24   59s  10/8/6   0.815
+     fieldAt 2  (default)        18.576   0.54    12/24   55s   9/6/9   0.607
+     fieldAt 3                   14.583    1.04    6/24   51s   7/14/3  0.189
+
+   Weight sweep, 10 seeds, one axis at a time (noisy at that seed count —
+   the numbers below moved by 2 points of fitness on re-draws, so read them
+   as "this term matters" rather than as an optimum):
+
+     wPress   0.15  0.30  0.45  0.60  0.80  1.00
+              15.8  15.6  15.8  17.7  13.5  16.7
+     wThreat  3     6     9     14    15
+              12.3  10.2  17.7  12.5  14.0
+     wCover   0     1.5   3     6
+               9.4  13.8  17.7  15.4
+     commitTime 0.2  0.55  1.0        shieldHold 0     0.8   1.6
+                16.5  17.7  15.2                 17.7  14.8  14.0
+
+   Zeroing either wThreat or wCover costs 5-8 points of fitness, so both
+   the line-of-sight term and buildNav's precomputed cover score are doing
+   real work. shieldHold — holding fire to keep the 1.6 s spawn bubble
+   alive — is a clean negative and stays off by default.
+   --------------------------------------------------------------------- */
 
 module.exports = {
   name: 'threatfld',

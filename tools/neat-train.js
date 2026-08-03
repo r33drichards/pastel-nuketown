@@ -170,13 +170,22 @@ function rollout(seed, policySource, maxTicks) {
 
    Both fade linearly to nothing by generation ANNEAL, after which the
    objective IS the fitness the tournament measures. Finalists are then
-   re-scored uncapped and unshaped through eval-policy.js itself. */
-const HIT_CREDIT = 0.04;
-const AIM_CREDIT = 6.0;
-const ANNEAL = 12;
+   re-scored uncapped and unshaped through eval-policy.js itself.
+
+   The shaping is ADDED to the real fitness, not folded inside its
+   divisor. Folding it inside was tried and it breeds cowards: with zero
+   kills the score is shapeW*aim/(deaths+1), and cutting deaths from two
+   to zero triples that while tripling aim quality is hard, so five
+   generations went into learning to hide rather than to shoot. Added
+   outside, hiding earns nothing -- the aim term only accumulates on
+   ticks when an enemy is actually visible, so a genome that never looks
+   at anybody scores zero on it. */
+const HIT_CREDIT = 0.05;
+const AIM_CREDIT = 8.0;
+const ANNEAL = 20;
 let shapeW = 1;
 const shaped = r =>
-  (r.kills + shapeW * (HIT_CREDIT * r.hits + AIM_CREDIT * r.aim)) / (r.deaths + 1);
+  r.kills / (r.deaths + 1) + shapeW * (HIT_CREDIT * r.hits + AIM_CREDIT * r.aim);
 const realStreakOf = g => g.rows.reduce((a, r) => a + r.streak, 0) / g.rows.length;
 
 /* ---- genome ----------------------------------------------------------- */
@@ -529,12 +538,18 @@ for (let gen = gen0; gen < gen0 + GENS; gen++) {
   /* ---- offspring in proportion to summed SHARED fitness ------------- */
   const totalShared = species.reduce((a, s) => a + s.sum, 0) || 1;
   const next = [];
+  /* The paper copies the champion of a species with more than five
+     members through unchanged. At population 32 spread over eight
+     species almost nothing clears that bar, so the best genome in the
+     run could be -- and was -- mutated away every generation. Species of
+     three or more keep their champion, and the overall best is always
+     carried, which is elitism the paper leaves implicit in its much
+     larger populations. */
   for (const s of species) {
-    /* champion of a species with more than five members carries over
-       unchanged, as in the paper */
-    if (s.members.length > 5) next.push(copyGenome(s.members[0]));
+    if (s.members.length >= 3) next.push(copyGenome(s.members[0]));
   }
   if (!next.length) next.push(copyGenome(species[0].members[0]));
+  if (best) next.push(copyGenome(best));
 
   for (const s of species) {
     const quota = Math.floor(POP * s.sum / totalShared);
