@@ -112,10 +112,13 @@ const seconds = Number(process.argv[2] || 60);
 const SEEDS = [1, 2, 3, 4];
 const LATENCIES = (process.argv[3] || '20,96,200').split(',').map(Number);
 
-const ARMS = [
-  { name: 'as shipped', overrides: null },
-  { name: 'centred', overrides: { fireCone: 0.02 } }
-];
+/* Explicit values rather than "whatever the file ships": the shipped default
+   is the thing under test, so an arm defined as its absence moves with it.
+   0.015 rad is a body's own angular half-width at the 24m this policy
+   engages at, so the sweep brackets it. */
+const ARMS = (process.argv[4] || '0.103612,0.05,0.02,0.01').split(',').map(v => ({
+  name: 'cone ' + v, overrides: { fireCone: Number(v) }
+}));
 
 console.log(`${seconds}s per match, ${SEEDS.length} seeds, guest driven by the policy\n`);
 console.log('latency  arm          guest shots  host shots  markers  landed  backed   kills');

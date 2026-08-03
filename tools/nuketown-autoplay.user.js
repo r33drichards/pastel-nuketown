@@ -651,7 +651,7 @@ const POLICY = (() => {
   if (typeof POLICY === 'undefined' || !POLICY || typeof POLICY.act !== 'function') {
     console.error('[auto] policy failed to install'); return;
   }
-  POLICY.setParams([24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332]);
+  POLICY.setParams([24.030481,2.256479,0.020000,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332]);
 
   /* ---- the arsenal ----------------------------------------------------
      The vector was tuned for the smg, so that stays the first choice. But
