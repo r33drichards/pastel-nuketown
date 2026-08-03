@@ -147,6 +147,24 @@ npm run check      # syntax-check every source file + tests + build freshness
 
 The test suite covers bot navigation, weapon validation, wire protocol parsing, room lifecycle, origin allowlisting, hostile-input rejection, and — through a headless harness that runs the real client — guest-side prediction, the host/guest fairness baseline, and the matchmaking decisions PLAY makes on the player's behalf.
 
+### Spectator camera
+
+`tools/spectator.js` is a paste-into-the-console free camera, for watching a match from above instead of down a barrel. Open the game, paste the whole file into the browser console, and press <kbd>V</kbd>.
+
+| Input | Action |
+|---|---|
+| V | Spectator on / off |
+| W A S D | Fly (in top-down view: pan) |
+| Space / C | Up / down |
+| Shift / Alt | 3× speed / quarter speed |
+| Scroll wheel | Fly speed, or follow distance |
+| T | Snap to a top-down view of the whole arena |
+| R | Back to free flight |
+| F, then [ / ] | Follow a player; previous / next |
+| H | Hide the HUD and the help card |
+
+It takes over `updateCamera()` and swallows input in the capture phase, then puts both back when you leave, so nothing else in the page is disturbed. It moves the camera and nothing else: the match keeps running, and your own player stands where you left it — still shootable, and no gun of your own on screen. Nobody else's client is affected, so this is a way to watch your own page, not a spectator slot on the relay.
+
 ### The pre-commit hook
 
 `index.html` is tracked, so every commit touching `src/` has to carry a rebuilt copy or `npm run check` fails on build freshness. Forgetting surfaces later as a red branch rather than at the moment it was caused, so `.githooks/pre-commit` rebuilds and stages the artefact alongside the change that caused it.
