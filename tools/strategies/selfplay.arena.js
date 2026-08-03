@@ -253,6 +253,15 @@ function runArena(seed, opts = {}) {
   const inst = createInstance(clock);
   inst.run(`Math.random = (${mulberry32.toString()})(${(seed >>> 0) || 1});`);
   inst.run(SIM_BOOT);
+  /* The shipped driver announces itself on install, once per match, which is
+     a hundred lines of banner in a league run. Errors still come through. */
+  if (!opts.chatty) {
+    /* Replace the BINDING, not the object: net-sim hands the vm node's own
+       console, so `console.log = ...` inside the vm silences this process. */
+    inst.context.console = {
+      log() {}, warn() {}, info() {}, debug() {}, error: console.error.bind(console)
+    };
+  }
 
   /* The player slot, if any, goes in exactly the way eval-policy.js does it:
      the policy source at top level plus the SHIPPED driver, so a match with
@@ -266,6 +275,24 @@ function runArena(seed, opts = {}) {
   inst.run('var __SP_MADE = [];');
   inst.run('var SPA = (' + ADAPTER.toString() + ')();');
   inst.run(`CFG.killsToWin = ${killsToWin};`);
+  /* ---- entropy -------------------------------------------------------
+     eval-policy.js varies a match by reseeding the BOT BRAINS, because that
+     is the only entropy that reaches a fixed bot. In a self-play match there
+     may be no fixed bots left: with all eight slots claimed the brains are
+     never consulted and every seed produced a byte-identical match (measured
+     -- six seeds, six identical 73-71 scorelines).
+
+     The engine's own randomness is `const rng = mulberry32(0xC0FFEE)` in
+     src/10-core.js: one stream, fixed seed, feeding spawn choice
+     (pickSpawn adds rng()*6 to every candidate) and every shot's spread. The
+     const cannot be reassigned from here, but the stream can be ADVANCED,
+     which shifts spawns and spread for the whole match. So the seed burns a
+     draw count off it before the match is set up. Same burn for both sides
+     of a paired comparison, different burn per seed. */
+  const burn = opts.rngBurn === undefined
+    ? (Math.imul(seed >>> 0, 2654435761) >>> 0) % 4093
+    : opts.rngBurn;
+  inst.run(`for (let i = 0; i < ${burn}; i++) rng();`);
   inst.run('startMatch();');
   inst.run(RESEED(seed));
 
@@ -340,7 +367,7 @@ function runArena(seed, opts = {}) {
   });
 
   return {
-    seed, seconds: ticks * FIXED, ticks,
+    seed, rngBurn: burn, seconds: ticks * FIXED, ticks,
     over: !!inst.get('G.over'),
     actors,
     entrants: entrants.map((e, i) => {
@@ -376,7 +403,12 @@ function verify(opts = {}) {
   inst.run(`Math.random = (${mulberry32.toString()})(${seed});`);
   inst.run(SIM_BOOT);
   inst.run('var __SP_MADE = [];');
-  inst.run('var SPA = (' + ADAPTER.toString() + ')();');
+  /* `mutate` is the negative control: a test that cannot fail proves nothing,
+     so `--flip` breaks the yaw translation on purpose and the checks below
+     have to notice. */
+  let adapter = 'var SPA = (' + ADAPTER.toString() + ')();';
+  if (opts.mutate) adapter = opts.mutate(adapter);
+  inst.run(adapter);
   inst.run('CFG.killsToWin = 9999;');
   inst.run('startMatch();');
   inst.run(RESEED(seed));
@@ -486,11 +518,24 @@ module.exports = {
 if (require.main === module) {
   const cmd = process.argv[2] || 'verify';
   if (cmd === 'verify') {
-    const r = verify({ seed: Number(process.argv[3] || 1) });
+    /* --flip is the negative control: unflip the yaw on the way out and the
+       bot should aim exactly backwards. If these checks still pass, they are
+       not testing anything. */
+    const flip = process.argv.includes('--flip');
+    const r = verify({
+      seed: Number(process.argv[3] || 1),
+      mutate: flip ? (s => s.replace('aimYaw: yflip(yaw),', 'aimYaw: yaw,')) : null
+    });
+    if (flip) console.log('  (negative control: yaw translation deliberately removed)');
     for (const c of r.checks) {
       console.log((c.pass ? '  ok   ' : '  FAIL ') + c.name);
       const { name, pass, ...rest } = c;
       console.log('       ' + JSON.stringify(rest));
+    }
+    if (flip) {
+      console.log(r.pass ? '\nNEGATIVE CONTROL PASSED — the checks have no teeth'
+                         : '\nnegative control failed as it must');
+      process.exit(r.pass ? 1 : 0);
     }
     console.log(r.pass ? '\nadapter verified' : '\nADAPTER BROKEN');
     process.exit(r.pass ? 0 : 1);

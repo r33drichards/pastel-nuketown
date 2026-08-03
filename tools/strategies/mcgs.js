@@ -103,13 +103,47 @@
    a matrix, and the search became pure arithmetic.
 
    ---------------------------------------------------------------------
-   RESULT: it does not beat the reactive policy. See the report; the short
-   version is that 10 seeds of tuning gains vanished on 10 held-out seeds,
-   more search made it no better (256 sims scored worse than 128, and depth 2
-   scored the same as depth 5), and the reason is almost certainly that the
-   forward model freezes the enemies where they stand -- which is wrong by
-   10-20 m by the second macro-step, so there is nothing there for depth to
-   find.
+   THE VALUE HEAD (mcgs.net.json)
+
+   The first version's U(n) was a hand-written linear guess, and the
+   ablations said that guess -- not the search -- was the binding
+   constraint: 256 simulations scored WORSE than 128, and depth 2 scored the
+   same as depth 5. When more search does not help, the thing being searched
+   is wrong.
+
+   So U(n) is now trained. It predicts P(the local player dies within 3.0
+   seconds of being in this abstract state), from 13 features of that state,
+   through one 16-unit tanh layer -- 241 weights, hand-rolled backprop and
+   Adam, no dependencies, serialised as a plain array so it drops into a
+   Tampermonkey userscript with a strict CSP and nothing to fetch.
+
+   Survival is the right target because fitness is 25/(deaths+1): kills are
+   capped at 25 and always taken, so deaths are the whole of it. Labels are
+   free -- log the feature vector at every replan, then ask whether a death
+   landed in the next 3 s.
+
+   It works as a predictor: 8516 labelled states over 48 matches, 6.7%
+   positive, class-weighted loss, split by MATCH (two replans a quarter
+   second apart are the same example twice), best held-out AUC 0.86.
+
+   And it moves the arm: on 20 held-out seeds the trained head scores 15.52
+   against the hand-written U's 13.79. It is worth its 241 weights.
+
+   ---------------------------------------------------------------------
+   RESULT: still does not beat the reactive policy, at any depth, trained or
+   not. Held out on seeds 1001-1020, 20 paired matches:
+
+       shipped              15.31   0.85 deaths    5/20 perfect
+       mcgs, hand U         13.79   1.25 deaths    5/20 perfect   4b/11w
+       mcgs, trained U      15.52   1.00 deaths    7/20 perfect   7b/9w
+       mcgs, trained U d2   17.08   0.85 deaths    9/20 perfect   7b/5w  p=0.77
+
+   And the depth ablation, re-run after training, still shows nothing:
+   d1 12.08, d2 14.58, d3 12.29, d5 12.71 on the dev seeds -- no trend, just
+   noise. A good value function evaluated on a wrongly-imagined future state
+   is still wrong, and this forward model freezes the enemies where they
+   stand while they move at 5.3 m/s. That is the ceiling, and it is not a
+   ceiling more search or more training removes.
    ===================================================================== */
 
 function POLICY_BODY() {
@@ -157,7 +191,7 @@ function POLICY_BODY() {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
     strafePeriod: 1.1, strafeAmount: 0.8, sprintRange: 18,
     reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0,
-    sims: 128, maxDepth: 5, cPuct: 1.4, tau: 3.5, dwell: 1.4,
+    sims: 128, maxDepth: 2, cPuct: 1.4, tau: 3.5, dwell: 1.4,
     killW: 1.0, dmgW: 1.0, deathW: 6.0, riskW: 0.5, oppW: 0.25, hpW: 0.4,
     priorBeta: 1.6, planHz: 7, commitS: 0.7, fleeHp: 45, coverMul: 0.35,
     botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7,
@@ -968,17 +1002,17 @@ function POLICY_BODY() {
    one. */
 const fs = require('node:fs');
 const pathmod = require('node:path');
-const NET_FILE = process.env.MCGS_NET_FILE ||
+const netFile = () => process.env.MCGS_NET_FILE ||
   pathmod.join(__dirname, 'mcgs.net.json');
 
 function netLiteral() {
-  try { return 'var MCGS_NET = ' + fs.readFileSync(NET_FILE, 'utf8') + ';\n'; }
+  try { return 'var MCGS_NET = ' + fs.readFileSync(netFile(), 'utf8') + ';\n'; }
   catch (e) { return 'var MCGS_NET = null;\n'; }
 }
 
 module.exports = {
   name: 'mcgs',
   describe: 'Monte-Carlo graph search over (region, enemy set, hp, ammo) with a trained P(death within 3s) value head',
-  netFile: NET_FILE,
+  netFile,
   policySource: () => netLiteral() + 'const POLICY = (' + POLICY_BODY.toString() + ')();'
 };
