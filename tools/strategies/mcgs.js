@@ -54,12 +54,16 @@
        is uniquely defined on a cyclic graph -- so sharing a node between
        paths of different depth is sound, which a plain undiscounted
        finite-horizon value would not be.
-     * NO-REVISIT WITHIN THE DESCENT PATH. The search keeps the set of
-       abstract keys on the current path and refuses to select an edge back
-       into it. Because the key contains health and the enemy set, a literal
-       revisit means a loop that changed nothing at all -- a strictly
-       dominated plan -- so forbidding it costs nothing and stops the search
-       burning its budget spinning in a two-cycle.
+     * CUT, DO NOT BAN. The search keeps the set of abstract keys on the
+       current descent path. An edge back into that set is still SELECTABLE
+       -- it is scored r + gamma^dt * Q(child) using the shared node's
+       current value -- but the descent stops there instead of recursing.
+       Banning such edges was tried first and is simply wrong: "stand where
+       you are and fight" maps the abstract state to itself, so it is a
+       self-loop, and banning self-loops bans the most important action in
+       the game. (That bug showed up as the planner refusing to hold ground:
+       an ablation that should have reproduced the shipped policy exactly
+       diverged after seven seconds.)
 
      A depth cap (maxDepth) is kept as well, purely as a budget guard.
 
@@ -101,7 +105,10 @@ function POLICY_BODY() {
     'fleeHp',      // below this health a move is a break, not a reposition
     'coverMul',    // exposure multiplier for the cover stance
     'botDpsK',     // scales the modelled bot damage output
-    'ourDpsK'      // scales the modelled player damage output
+    'ourDpsK',     // scales the modelled player damage output
+    'stayBias',    // reward added to "stand and fight"; large = never replan
+    'breakLook',   // 1 = turn and run when breaking, 0 = keep facing the enemy
+    'moveStrafe'   // strafe oscillation kept on top of a repositioning walk
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
@@ -109,16 +116,16 @@ function POLICY_BODY() {
     [16, 512], [2, 8], [0.5, 4], [1, 10], [0.3, 2.5],
     [0.2, 3], [0.2, 4], [1, 20], [0, 2], [0, 1.5], [0, 1.5],
     [0.2, 6], [3, 20], [0.2, 3], [0, 90], [0.1, 1],
-    [0.3, 2.5], [0.3, 2.5]
+    [0.3, 2.5], [0.3, 2.5], [0, 4], [0, 1], [0, 1]
   ];
   const P = {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
     strafePeriod: 1.1, strafeAmount: 0.8, sprintRange: 18,
     reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0,
-    sims: 128, maxDepth: 5, cPuct: 1.4, tau: 3.5, dwell: 0.9,
+    sims: 128, maxDepth: 5, cPuct: 1.4, tau: 3.5, dwell: 1.4,
     killW: 1.0, dmgW: 1.0, deathW: 6.0, riskW: 0.5, oppW: 0.25, hpW: 0.4,
     priorBeta: 1.6, planHz: 7, commitS: 0.7, fleeHp: 45, coverMul: 0.35,
-    botDpsK: 1.0, ourDpsK: 1.0
+    botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7
   };
 
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -245,11 +252,43 @@ function POLICY_BODY() {
     };
   }
 
+  /* ---- region-to-region visibility ----------------------------------
+     canSee() is a ray against every solid on the map and costs ~42 us --
+     forty times a nav.nearest. Asking it per (region, enemy) inside the
+     search cost 4-5 ms a replan, which is not a browser budget.
+
+     But visibility between two REGIONS does not change: the map is static.
+     So it is a matrix, computed once. It is built a row at a time, on the
+     first search that touches a region, so the cost arrives as ~90 rays
+     (~3.8 ms) spread over the first minute of a match instead of a 170 ms
+     stall at startup. After that the whole forward model is arithmetic:
+     zero raycasts per replan. */
+  let VIS = null, VISROW = null, VISRAYS = 0;
+
+  function visOf(a, b) {
+    if (!VISROW[a]) {
+      const R = RG.R, ax = RG.rx[a], ay = RG.ry[a] + 1.6, az = RG.rz[a];
+      for (let c = 0; c < R; c++) {
+        const v = (a === c) ? 1
+          : (canSee(ax, ay, az, RG.rx[c], RG.ry[c] + 1.6, RG.rz[c]) ? 1 : 0);
+        VIS[a * R + c] = v; VIS[c * R + a] = v;      // symmetric
+        VISRAYS++;
+      }
+      VISROW[a] = 1;
+    }
+    return VIS[a * RG.R + b];
+  }
+
   function ensureNav(G) {
     const nav = G.nav || (typeof AI !== 'undefined' && typeof MAP !== 'undefined'
       ? AI.buildNav(MAP) : null);
     if (!nav) return null;
-    if (NAVREF !== nav) { NAVREF = nav; RG = buildRegions(nav); }
+    if (NAVREF !== nav) {
+      NAVREF = nav;
+      RG = buildRegions(nav);
+      VIS = new Uint8Array(RG.R * RG.R);
+      VISROW = new Uint8Array(RG.R);
+    }
     return nav;
   }
 
@@ -299,6 +338,10 @@ function POLICY_BODY() {
       S.react[i] = sk.react;
       S.hp[i] = Math.max(1, a.health || 100);
       S.errK[i] = sk.err;
+      /* an enemy is placed in the abstraction the same way we are: by the
+         region it stands in. Eight nav.nearest calls a replan, ~3.5 us each. */
+      const nid = NAVREF.nearest(a.pos.x, a.pos.y, a.pos.z);
+      S.ereg[i] = nid >= 0 ? RG.reg[nid] : 0;
       S.aliveMask |= (1 << i);
     }
     S.n = list.length;
@@ -312,24 +355,23 @@ function POLICY_BODY() {
       S.dstTab = new Float32Array(RG.R * MAXE);
     }
   }
-  S.errK = [];
+  S.errK = []; S.ereg = [];
   S.dpsTab = null; S.dstTab = null;
 
-  /* Does enemy e hold a sightline onto region r's best spot, and if so how
-     hard does it hurt? One raycast per (region, enemy) pair, memoised for
-     the life of the replan, and only for regions the search actually
-     touches -- which is what keeps this affordable. */
+  /* Does enemy i hold a sightline onto region r, and if so how hard does it
+     hurt? A matrix lookup plus a distance, memoised per region for the life
+     of the replan. */
   function losOf(r) {
     if (S.seen[r] === S.stamp) return S.losMask[r];
     S.seen[r] = S.stamp;
     let mask = 0;
-    const ex = RG.rx[r], ey = RG.ry[r] + 1.6, ez = RG.rz[r];
+    const ex = RG.rx[r], ez = RG.rz[r];
     const base = r * MAXE;
     for (let i = 0; i < S.n; i++) {
       const d = Math.hypot(S.ax[i] - ex, S.az[i] - ez);
       S.dstTab[base + i] = d;
       let dps = 0;
-      if (d < 60 && canSee(ex, ey, ez, S.ax[i], S.ay[i] + 1.6, S.az[i])) {
+      if (d < 60 && visOf(r, S.ereg[i])) {
         mask |= (1 << i);
         /* aim error opens a cone that grows with range; a 0.45m target in it */
         dps = S.dps[i] * clamp(0.45 / (0.45 + S.errK[i] * d), 0.05, 0.9);
@@ -479,7 +521,9 @@ function POLICY_BODY() {
 
   function expand(node) {
     const acts = [];
-    acts.push(makeAct(node, node.r, false));   // stand and fight
+    const stand = makeAct(node, node.r, false);   // stand and fight
+    stand.r += P.stayBias;                        // ablation / commitment knob
+    acts.push(stand);
     acts.push(makeAct(node, node.r, true));    // sit in the cover, hold fire
     const s = RG.adjStart[node.r], e = RG.adjStart[node.r + 1];
     for (let k = s; k < e; k++) acts.push(makeAct(node, RG.adjTo[k], false));
@@ -510,14 +554,13 @@ function POLICY_BODY() {
   /* PUCT on EDGE visits, exactly the formula in GraphSearch.md. The child
      node may carry far more visits than this edge does -- that is the whole
      point of the graph -- and the exploration term must not see them. */
-  function select(node, path) {
+  function select(node) {
     const acts = node.acts;
     const sq = Math.sqrt(node.edgeN + 1e-9);
     const fpu = node.Q - 0.25;
     let best = null, bs = -Infinity;
     for (let i = 0; i < acts.length; i++) {
       const a = acts[i];
-      if (!a.dead && path.has(a.sKey)) continue;   // no-revisit-within-path
       const q = a.n > 0 ? a.A : (a.r + a.disc * fpu);
       const u = P.cPuct * a.P * sq / (1 + a.n);
       const s = q + u;
@@ -529,15 +572,29 @@ function POLICY_BODY() {
   function simulate(node, depth, path) {
     if (depth >= P.maxDepth) return node.Q;
     if (!node.acts) { expand(node); backup(node); return node.Q; }
-    const a = select(node, path);
+    const a = select(node);
     if (!a) return node.Q;
-    if (a.dead) {
+    if (a.dead) {                       // terminal: the reward is the whole value
       a.n++; a.A = a.r;
       backup(node);
       return node.Q;
     }
     let child = a.child;
     if (!child) child = a.child = getNode(a.sKey, a.toR, a.sMask, a.sHp, a.sAmmo);
+    /* CYCLE. The successor is already on this descent path -- most often it
+       IS this node, because "stand where you are and fight" maps the abstract
+       state to itself. Banning the edge was the first thing tried and it is
+       wrong: it bans the single most important action in the game. Instead
+       take the edge but do not descend, and value it with the shared node's
+       current Q. That terminates, it keeps every action available, and under
+       the time discount r + gamma*Q(n) is exactly the one-step backup of the
+       fixed point that repeating the action converges to. */
+    if (path.has(a.sKey)) {
+      a.n++;
+      a.A = a.r + a.disc * child.Q;
+      backup(node);
+      return node.Q;
+    }
     path.add(a.sKey);
     simulate(child, depth + 1, path);
     path.delete(a.sKey);
@@ -552,7 +609,7 @@ function POLICY_BODY() {
      ================================================================= */
   const GOAL = { node: -1, region: -1, stance: 'engage', at: -1 };
   const PATHSET = new Set();
-  let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0 };
+  let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0 };
 
   function runPlan(me, G) {
     const nav = ensureNav(G);
@@ -578,7 +635,7 @@ function POLICY_BODY() {
       PATHSET.add(root.key);
       simulate(root, 0, PATHSET);
     }
-    STATS.plans++; STATS.sims += sims; STATS.nodes += table.size;
+    STATS.plans++; STATS.sims += sims; STATS.nodes += table.size; STATS.rays = VISRAYS;
 
     /* the move is the most-visited EDGE out of the root */
     let best = null;
@@ -591,6 +648,7 @@ function POLICY_BODY() {
     if (best.toR === r0 && !best.cover) stance = 'engage';
     else if (best.cover || S.hpNow < P.fleeHp) stance = 'break';
     else stance = 'reposition';
+    STATS[stance === 'engage' ? 'engage' : (stance === 'break' ? 'brk' : 'reposition')]++;
 
     return { region: best.toR, node: RG.repNode[best.toR], stance };
   }
@@ -629,6 +687,7 @@ function POLICY_BODY() {
     if (!nav || goal.node < 0) return null;
     if (goal.node !== pathGoal || !path || pathI >= path.length) {
       path = nav.findPath(me.pos, goal.node, 420);
+      STATS.paths++;
       pathI = path.length > 1 ? 1 : 0;
       pathGoal = goal.node;
     }
@@ -659,7 +718,7 @@ function POLICY_BODY() {
       path = null; pathI = 0; pathGoal = -1;
       GOAL.node = -1; GOAL.region = -1; GOAL.stance = 'engage';
       table.clear();
-      STATS = { plans: 0, nodes: 0, sims: 0 };
+      STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0 };
     },
     stats: () => STATS,
     /* for the offline timer: run the search n times, nothing else */
@@ -719,10 +778,15 @@ function POLICY_BODY() {
         /* Breaking contact means turning and running: sprint needs fwd > 0
            and a released trigger, and neither is possible while facing down
            a sightline you are trying to leave. */
-        if (stance === 'break') wantYaw = Math.atan2(mv.dx, mv.dz);
+        if (stance === 'break' && P.breakLook > 0.5) wantYaw = Math.atan2(mv.dx, mv.dz);
         const b = bodyFrame(wantYaw, mv.dx, mv.dz);
         fwd = clamp(b.fwd, -1, 1);
-        strafe = clamp(b.strafe, -1, 1);
+        /* Keep the tuned strafe oscillation riding on top of the walk. Most
+           damage is taken moving in a straight line, and a path is nothing
+           but straight lines. */
+        phase += dt / Math.max(0.05, P.strafePeriod);
+        if (phase >= 1) { phase = 0; strafeSign = -strafeSign; }
+        strafe = clamp(b.strafe + (visible ? strafeSign * P.moveStrafe : 0), -1, 1);
         sprint = stance === 'break' && fwd > 0.55;
       }
 

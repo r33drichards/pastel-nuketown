@@ -64,9 +64,15 @@
    shipped policy's turnRate cap. The network cannot teleport the
    crosshair, so anything that evolves here is shippable.
 
-   The sensors run at SENSE_HZ, not every tick; the outputs are held in
-   between. Aim rates integrate every tick regardless, so holding costs
-   nothing in smoothness and saves ~3x the raycasts.
+   The sensors run every SENSE_EVERY ticks, not every tick; the outputs
+   are held in between while the aim rates keep integrating. Decimation
+   is not free here: a held RATE overshoots, because unlike the shipped
+   policy the network cannot clamp its turn to the exact remaining aim
+   error. A hand-built seven-link genome scored 37% hit rate at 30 Hz
+   against 23% at 15 Hz and 38% at 60 Hz, so 30 Hz buys back nearly all
+   of the accuracy for two thirds of the sensor cost. The same sweep put
+   the best turn cap at 12-14 rad/s rather than the shipped 22: a coarse
+   controller with a high cap just spins past the target.
 
    One reflex is hard-wired: an empty magazine always calls tryReload.
    An empty gun has exactly one sensible action, the driver only swaps
@@ -78,8 +84,8 @@
 
 const N_IN = 37;
 const N_OUT = 8;
-const TURN_RATE = 22.0;    // rad/s, the cap on aim movement
-const SENSE_EVERY = 4;     // ticks between forward passes (60 Hz / 4 = 15 Hz)
+const TURN_RATE = 14.0;    // rad/s, the cap on aim movement
+const SENSE_EVERY = 2;     // ticks between forward passes (60 Hz / 2 = 30 Hz)
 
 /* ---- the evolved genome --------------------------------------------
    hidden: node ids of hidden neurons, in creation order.

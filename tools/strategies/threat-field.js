@@ -10,11 +10,11 @@
 
    No search, no learning, no per-tick planning. Every RECOMPUTE_TICKS ticks it
    runs one bounded Dijkstra over the nav graph from the node under its feet,
-   scores a subsample of the reachable nodes with a weighted sum of four terms,
+   scores a subsample of the reachable nodes with a weighted sum of five terms,
    and walks the graph path to the winner. The reactive layer above it —
    pickTarget, capped turn, fire cone, strafe — is the shipped code verbatim.
 
-   The four terms (see FIELD WEIGHTS below):
+   The five terms (see FIELD WEIGHTS below):
 
      THREAT       for each living enemy with line of sight to the node,
                   a range-decayed danger weight; summed, then raised to
@@ -22,12 +22,18 @@
                   times one watcher.
      COVER        the `cover` score buildNav already computed for all 3156
                   nodes and nobody was using.
-     OPPORTUNITY  a node you can shoot from is the point. Peaks at the tuned
-                  engageRange (clamped to the weapon's range) and is divided
-                  by how many enemies can see the node, so a 1v1 angle is
-                  worth much more than the same angle in a 1v3.
+     OPPORTUNITY  a node you can shoot from is the point. Full credit inside
+                  the tuned engageRange (clamped to the weapon's range),
+                  falling off beyond it, and divided by how many enemies can
+                  see the node — so a 1v1 angle is worth much more than the
+                  same angle in a 1v3.
      TRAVEL       Dijkstra cost to get there. Keeps the goal local and stops
                   the bot crossing the map for a marginally better corner.
+     PRESSURE     the attractive half: cost per metre the node sits beyond
+                  the engagement radius of the current target. Without it
+                  the field is all repulsion, the bot settles in an empty
+                  covered pocket and the match takes half as long again for
+                  the same 25 kills — which is a straight fitness loss.
 
    Dithering is handled in three explicit places, not by luck:
      1. the field is recomputed at RECOMPUTE_TICKS, not every tick;
@@ -63,15 +69,17 @@ const POLICY = (() => {
     'wTravel',       // cost per metre of Dijkstra path to the node
     'threatDecay',   // metres: e-folding distance of an enemy's danger
     'oppBand',       // metres: width of the "good shooting range" window
+    'wPress',        // cost per metre the node is too far from the target
     'switchMargin',  // a rival must beat the held goal by this to take over
     'commitTime',    // seconds a goal is held no matter what
-    'hurtBoost'      // extra threat weight at zero health (0 = ignore health)
+    'hurtBoost',     // extra threat weight at zero health (0 = ignore health)
+    'shieldHold'     // seconds of the spawn bubble to spend moving, not shooting
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
     [0, 1], [4, 40], [0, 0.9], [0.8, 2.0], [0.5, 6],
     [0, 40], [1, 3], [0, 20], [0, 30], [0, 3],
-    [5, 60], [2, 30], [0, 8], [0, 3], [0, 4]
+    [5, 60], [2, 30], [0, 3], [0, 8], [0, 3], [0, 4], [0, 1.6]
   ];
   const P = {
     /* the shipped tuned vector, so the policy is correct even if nobody
@@ -82,8 +90,8 @@ const POLICY = (() => {
     searchTurn: 3.160332,
     /* ---- FIELD WEIGHTS ---- */
     wThreat: 9.0, threatExp: 1.75, wCover: 3.0, wOpp: 7.0, wTravel: 0.45,
-    threatDecay: 22.0, oppBand: 9.0, switchMargin: 1.5, commitTime: 0.55,
-    hurtBoost: 1.0
+    threatDecay: 22.0, oppBand: 9.0, wPress: 0.60, switchMargin: 1.5,
+    commitTime: 0.55, hurtBoost: 1.0, shieldHold: 0
   };
 
   /* ---- structural constants: shape of the search, not tuning knobs ---- */
@@ -104,6 +112,7 @@ const POLICY = (() => {
 
   /* ---- nav state, built lazily: G.nav does not exist until startMatch ---- */
   let nav = null, dist = null, parent = null, stamp = null, closed = null, epoch = 0;
+  let navTries = 0;
   let heapId = null, heapF = null, heapN = 0;
 
   /* Line of sight, allocation-free.
@@ -273,6 +282,7 @@ const POLICY = (() => {
 
   /* Lower is better. Threat and travel are costs, cover and opportunity are
      rewards; the sum is what the goal choice minimises. */
+  let pressX = 0, pressZ = 0, pressOn = false;
   function scoreNode(n, g, idealRange, wRange, threatW) {
     const ey = n.y + EYE;
     let exposure = 0, watchers = 0, opp = 0;
@@ -284,10 +294,20 @@ const POLICY = (() => {
       /* THREAT: an enemy that can see you but is 40 m away is not the same
          problem as one at 6 m. */
       exposure += Math.exp(-d / P.threatDecay);
-      /* OPPORTUNITY: best angle available from this node. */
+      /* OPPORTUNITY: the best angle available from this node. One-sided on
+         purpose. A symmetric bell around engageRange scored a point-blank
+         angle at ~0.04 and the field answered by parking in empty cover:
+         ticks with nobody in sight went from 36% to 55% and the match got
+         half as long again for the same 25 kills. Anything inside the
+         effective range is a shot; only being too far to hit costs. Being
+         too close is already priced by the threat term, which rises as the
+         enemy gets nearer. */
       if (d <= wRange) {
-        const q = (d - idealRange) / P.oppBand;
-        const v = Math.exp(-q * q);
+        let v = 1;
+        if (d > idealRange) {
+          const q = (d - idealRange) / P.oppBand;
+          v = Math.exp(-q * q);
+        }
         if (v > opp) opp = v;
       }
     }
@@ -295,13 +315,25 @@ const POLICY = (() => {
              - P.wCover * n.cover
              + P.wTravel * g;
     if (watchers > 0) cost -= P.wOpp * opp / watchers;
+    /* PRESSURE: the attractive half of the potential. Without it the field is
+       purely repulsive and, once out of everyone's sight, every nearby node
+       looks alike — so the bot settles into a covered pocket and the match
+       drags. Paying per metre beyond the engagement radius gives a gradient
+       that flows toward the enemy *through* whatever cover is on the way,
+       which is the whole point of doing this on the nav graph. Nothing is
+       charged once inside the ring; where to stand in it is the other terms'
+       business. */
+    if (pressOn) {
+      const pd = Math.hypot(pressX - n.x, pressZ - n.z);
+      if (pd > idealRange) cost += P.wPress * (pd - idealRange);
+    }
     return cost;
   }
 
   /* ---- commitment state ---- */
   let goalId = -1, goalSince = -1e9, steer = null, holding = false;
 
-  function replan(me, G) {
+  function replan(me, G, target) {
     const startId = nav.nearest(me.pos.x, me.pos.y, me.pos.z);
     if (startId < 0) { goalId = -1; steer = null; return; }
     const list = explore(startId);
@@ -313,6 +345,8 @@ const POLICY = (() => {
     const idealRange = Math.min(P.engageRange, wRange * 0.9);
     const hp = clampv((me.health || 0) / (me.maxHealth || 100), 0, 1);
     const threatW = P.wThreat * (1 + P.hurtBoost * (1 - hp));
+    pressOn = !!target;
+    if (target) { pressX = target.pos.x; pressZ = target.pos.z; }
 
     const nodes = nav.nodes;
     let bestId = -1, bestScore = Infinity;
@@ -390,12 +424,17 @@ const POLICY = (() => {
     reset() {
       t = 0; phase = 0; strafeSign = 1; tick = 0;
       goalId = -1; goalSince = -1e9; steer = null; holding = false;
+      navTries = 0;
     },
 
     act(me, G, dt) {
       t += dt;
       if (!me.alive) { goalId = -1; steer = null; return null; }
-      if (!nav && !initNav(G)) nav = null;
+      /* G.nav does not exist until startMatch, so the graph is picked up on
+         the first tick. Bounded retries: if it is never going to arrive, do
+         not pay AI.buildNav sixty times a second forever — fall through to
+         the shipped body instead. */
+      if (!nav && navTries < 8) { navTries++; initNav(G); }
 
       const { target, dist: tdist, visible } = pickTarget(me, G);
       if (!target) return { yaw: me.yaw + P.searchTurn * dt };
@@ -416,7 +455,7 @@ const POLICY = (() => {
 
       /* ---- THE FIELD decides where the body goes ---- */
       if (nav && (tick++ % RECOMPUTE_TICKS) === 0) {
-        try { replan(me, G); } catch (e) { steer = null; }
+        try { replan(me, G, target); } catch (e) { steer = null; }
       }
 
       phase += dt / Math.max(0.05, P.strafePeriod);
@@ -451,13 +490,22 @@ const POLICY = (() => {
 
       const onTarget = Math.abs(dYaw) < P.fireCone && Math.abs(dPitch) < P.fireCone;
       const hasAmmo = me.ammo > 0;
+      /* The spawn bubble is 1.6 s of total immunity that pops the instant you
+         pull the trigger. Three of the shipped policy's ten deaths over seeds
+         1-10 land inside 0.7 s of a respawn, at full health, from 12 m — it
+         spawns, sees somebody, shoots, drops its own bubble and gets
+         head-shot. shieldHold spends the first shieldHold seconds of the
+         bubble walking the field instead of shooting. Default 0 keeps the
+         shipped behaviour; the value is swept, not assumed. */
+      const bubble = (typeof CFG !== 'undefined' && CFG.spawnShield) || 1.6;
+      const shielded = P.shieldHold > 0 && (me.shield || 0) > bubble - P.shieldHold;
       const mag = (WBY[me.weapon] && WBY[me.weapon].mag) || 30;
       if (!hasAmmo || me.ammo / mag <= P.reloadAt) tryReload(me);
 
       return {
         fwd, strafe,
         sprint: tdist > P.sprintRange && !visible && fwd > 0,
-        fire: visible && onTarget && hasAmmo,
+        fire: visible && onTarget && hasAmmo && !shielded,
         yaw, pitch
       };
     }
@@ -467,6 +515,6 @@ const POLICY = (() => {
 
 module.exports = {
   name: 'threatfld',
-  describe: 'potential field over the nav graph: threat, cover, opportunity, travel',
+  describe: 'nav-graph potential field: threat, cover, opportunity, pressure, travel',
   policySource: () => SOURCE
 };

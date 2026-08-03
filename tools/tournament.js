@@ -59,7 +59,16 @@ if (process.argv[2] === '--worker') {
 const SEEDS_N = Number(process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : 24);
 const onlyArg = process.argv.indexOf('--only');
 const ONLY = onlyArg > 0 ? process.argv[onlyArg + 1].split(',') : null;
-const SEEDS = Array.from({ length: SEEDS_N }, (_, i) => i + 1);
+/* Held out by default, and not seeds 1..N.
+
+   The forensics found the shipped policy dies 0.71 times a match on seeds
+   1-24 against 0.92 and 1.08 on two later blocks. Whatever the cause, the
+   low seeds are the ones every strategy here was developed against, and a
+   tournament run on them scores the baseline on its home ground. Start the
+   seed window somewhere nobody has been. */
+const fromArg = process.argv.indexOf('--from');
+const FIRST = fromArg > 0 ? Number(process.argv[fromArg + 1]) : 1001;
+const SEEDS = Array.from({ length: SEEDS_N }, (_, i) => FIRST + i);
 
 /* The shipped policy is always in the field: a strategy that cannot beat what
    is already installed is not a result, whatever its mean says. */
@@ -87,7 +96,8 @@ const files = fs.readdirSync(DIR)
 
 if (!files.length) { console.error('no strategies in ' + DIR); process.exit(1); }
 
-console.log(`${files.length} strategies x ${SEEDS.length} seeds, paired\n`);
+console.log(`${files.length} strategies x ${SEEDS.length} seeds ` +
+  `(${SEEDS[0]}..${SEEDS[SEEDS.length - 1]}), paired\n`);
 
 const results = [];
 let next = 0, running = 0;
@@ -184,7 +194,7 @@ function finish() {
   const stamp = new Date().toISOString();
   for (const t of table) {
     fs.appendFileSync(JOURNAL, JSON.stringify({
-      at: stamp, seeds: SEEDS.length, ...t,
+      at: stamp, seeds: SEEDS.length, firstSeed: SEEDS[0], ...t,
       sign: t.sign ? { ...t.sign } : null
     }) + '\n');
   }

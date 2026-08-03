@@ -21,11 +21,19 @@
      fitness by its species size; species get offspring in proportion
      to their summed shared fitness.
 
-     COMPLEXIFICATION. The initial population is the empty genome — no
-     hidden nodes, no connections — put through the mutation operator.
-     Structure only ever arrives by mutation, and speciation is what
-     gives a fresh structure time to be optimised before it has to
-     compete with the whole population.
+     COMPLEXIFICATION. The initial population is the paper's minimal
+     topology: NO HIDDEN NODES, every input wired straight to every
+     output, random weights. Hidden structure only ever arrives by node
+     mutation, and speciation is what gives a fresh structure time to be
+     optimised before it has to compete with the whole population.
+
+     (MarI/O's variant -- start from the EMPTY genome and let link
+     mutation wire it up -- was tried first and does not bootstrap here.
+     Five generations of pop 16 stayed at fitness 0.00: with 37 inputs a
+     single random link is almost always silent, and a network with no
+     link into the fire output never pulls the trigger at all, so there
+     is nothing for selection to grade. The paper's fully-connected
+     minimal start has an opinion about every output on generation one.)
 
    Usage:
      node tools/neat-train.js [--gens 25] [--pop 64] [--ticks 1200]
@@ -40,6 +48,12 @@ const ROOT = path.join(__dirname, '..');
 const { createInstance, FIXED, mulberry32 } = require(path.join(ROOT, 'net-sim.js'));
 const EP = require(path.join(__dirname, 'eval-policy.js'));
 const NEATPOL = require(path.join(__dirname, 'strategies', 'neat.js'));
+
+/* The shipped driver announces itself on every instance boot, which at a
+   few hundred instances a generation buries the only output that matters.
+   The vm shares this console, so silencing it here silences that. */
+const say = (...a) => process.stdout.write(a.join(' ') + '\n');
+console.log = () => {};
 
 const arg = (k, d) => {
   const i = process.argv.indexOf('--' + k);
@@ -78,6 +92,43 @@ const RESEED = seed => `
 `;
 const DRIVER = EP.driverSource(EP.userscript());
 
+/* A dense signal for the aiming sub-problem, wrapped around the driver's
+   own wrapper so it sees the state the policy just produced. Every fourth
+   tick, if any enemy is visible, score how close the crosshair is to the
+   closest-to-aim one: exp(-angular error / 0.15), which is 1 on target and
+   about 0.1 fifteen degrees off. Kills and even hits are far too sparse to
+   grade a first generation -- ninety random networks across nine different
+   initialisations landed ZERO hits between them in a 15 second match --
+   but aim quality is non-zero for everybody and points the right way. */
+const AIM_PROBE = `
+  var AIMSUM = 0, AIMN = 0, AIMTICK = 0;
+  {
+    const _sim = window.simulate;
+    window.simulate = function (dt) {
+      const out = _sim.apply(this, arguments);
+      if ((AIMTICK++ & 3) === 0) {
+        const me = G.player;
+        if (me && me.alive && G.started && !G.over) {
+          const eye = actorEye(me);
+          let best = -1;
+          for (const a of G.actors) {
+            if (a === me || a.isPlayer || !a.alive) continue;
+            if (!canSee(me.pos.x, eye, me.pos.z, a.pos.x, actorEye(a), a.pos.z)) continue;
+            const dx = a.pos.x - me.pos.x, dz = a.pos.z - me.pos.z;
+            const d = Math.hypot(dx, dz);
+            const wy = Math.atan2(dx, dz), wp = Math.atan2((a.pos.y + 1.5) - eye, d);
+            const ey = Math.atan2(Math.sin(wy - me.yaw), Math.cos(wy - me.yaw));
+            const q = Math.exp(-Math.hypot(ey, wp - me.pitch) / 0.15);
+            if (q > best) best = q;
+          }
+          if (best >= 0) { AIMSUM += best; AIMN++; }
+        }
+      }
+      return out;
+    };
+  }
+`;
+
 function rollout(seed, policySource, maxTicks) {
   const clock = { ms: 0 };
   const inst = createInstance(clock);
@@ -86,6 +137,7 @@ function rollout(seed, policySource, maxTicks) {
   inst.run(INSTRUMENT);
   inst.run(policySource);
   inst.run(DRIVER);
+  inst.run(AIM_PROBE);
   inst.run('startMatch();');
   inst.run(RESEED(seed));
   let ticks = 0;
@@ -96,23 +148,36 @@ function rollout(seed, policySource, maxTicks) {
   }
   const kills = inst.get('G.player.kills') || 0;
   const deaths = inst.get('G.player.deaths') || 0;
+  const aimN = inst.get('AIMN') || 0;
   return {
     seed, kills, deaths, ticks,
     hits: inst.get('HITS') || 0,
     spent: inst.get('SPENT_ROUNDS') || 0,
+    aim: aimN ? (inst.get('AIMSUM') || 0) / aimN : 0,
     streak: kills / (deaths + 1)
   };
 }
 
-/* Training fitness is SHAPED. The reported number is always the real
-   streak, kills/(deaths+1) -- but on a 20 second slice of a match, a
-   first-generation network gets zero kills and the whole population sits
-   at zero with nothing to select on. Hits are the cheapest evidence that
-   a network has learned to point at somebody and pull the trigger, so
-   they are worth a fortieth of a kill each while the search bootstraps.
-   Finalists are re-scored on the real thing, uncapped and unshaped. */
+/* Training fitness is SHAPED, and the shaping is ANNEALED AWAY. The
+   reported number is always the real streak, kills/(deaths+1) -- but on a
+   15 second slice of a match a first-generation network gets zero kills
+   AND zero hits, so the whole population sits at zero and selection is a
+   coin toss. Two extra terms carry the early search:
+
+     hits, worth a fortieth of a kill each -- evidence the network points
+     at somebody and pulls the trigger;
+     aim quality, the dense crosshair-proximity score above.
+
+   Both fade linearly to nothing by generation ANNEAL, after which the
+   objective IS the fitness the tournament measures. Finalists are then
+   re-scored uncapped and unshaped through eval-policy.js itself. */
 const HIT_CREDIT = 0.04;
-const shaped = r => (r.kills + HIT_CREDIT * r.hits) / (r.deaths + 1);
+const AIM_CREDIT = 6.0;
+const ANNEAL = 12;
+let shapeW = 1;
+const shaped = r =>
+  (r.kills + shapeW * (HIT_CREDIT * r.hits + AIM_CREDIT * r.aim)) / (r.deaths + 1);
+const realStreakOf = g => g.rows.reduce((a, r) => a + r.streak, 0) / g.rows.length;
 
 /* ---- genome ----------------------------------------------------------- */
 const N_IN = NEATPOL.N_IN, N_OUT = NEATPOL.N_OUT;
@@ -120,15 +185,30 @@ const IN_BIAS = N_IN - 1;                 // the constant-1 input
 const OUT0 = N_IN;                        // output ids OUT0 .. OUT0+N_OUT-1
 const HID0 = 100;                         // hidden ids start here
 
+/* Rates. MarI/O's numbers where they transfer, the paper's where they do
+   not. `connections` is the paper's 80% ("in each generation, 80% of
+   offspring had their connection weights mutated") rather than MarI/O's
+   0.25 -- with the population cut from 300 to 48 the search cannot
+   afford to leave three quarters of its children weight-identical to a
+   parent. `link` is down from 2.0 because the starting topology is
+   already fully connected, so most proposals are duplicates and get
+   rejected; what is left is the genuinely new hidden-node wiring. */
 const RATES = {
-  connections: 0.25,   // chance a child perturbs its weights at all
-  link: 2.0,           // expected new links per child
-  bias: 0.40,          // expected new links FROM the bias input
-  node: 0.50,          // chance of splitting a connection
+  connections: 0.80,   // chance a child perturbs its weights at all
+  link: 1.00,          // expected new links per child
+  bias: 0.20,          // expected new links FROM the bias input
+  node: 0.35,          // chance of splitting a connection
   enable: 0.20,
   disable: 0.40,
-  step: 0.10
+  step: 0.12
 };
+/* Initial and re-randomised weights. MarI/O draws U(-2, 2); with the
+   paper's steepened sigmoid (4.9) and inputs already normalised to
+   [-1, 1] that saturates every output into bang-bang control, and a
+   crosshair slewing at the full turn cap never settles on anybody. A
+   hand-built probe genome hit 37% of its shots with a 0.6 weight on the
+   aim-error input and 10% with 1.0, so the draw is U(-0.6, 0.6). */
+const WEIGHT_INIT = 0.6;
 const PERTURB_CHANCE = 0.90;
 const CROSSOVER_CHANCE = 0.75;
 const STALE_SPECIES = 8;    // MarI/O uses 15; this run is far shorter than
@@ -155,7 +235,19 @@ function innovation(from, to) {
   return v;
 }
 
-const newGenome = () => ({ genes: [], hidden: [], fitness: 0, shared: 0, rates: { ...RATES } });
+const emptyGenome = () => ({ genes: [], hidden: [], fitness: 0, shared: 0, rates: { ...RATES } });
+/* The paper's minimal structure: no hidden nodes, all inputs connected
+   directly to all outputs. */
+function newGenome() {
+  const g = emptyGenome();
+  for (let i = 0; i < N_IN; i++) {
+    for (let o = 0; o < N_OUT; o++) {
+      g.genes.push({ from: i, to: OUT0 + o, w: (rnd() * 2 - 1) * WEIGHT_INIT,
+                     enabled: true, innov: innovation(i, OUT0 + o) });
+    }
+  }
+  return g;
+}
 const copyGenome = g => ({
   genes: g.genes.map(x => ({ ...x })),
   hidden: g.hidden.slice(),
@@ -188,7 +280,7 @@ function linkMutate(g, fromBias) {
   const to = pick(sinks(g));
   if (from === to || isOutput(from) || isInput(to)) return;
   if (hasLink(g, from, to)) return;
-  g.genes.push({ from, to, w: rnd() * 4 - 2, enabled: true, innov: innovation(from, to) });
+  g.genes.push({ from, to, w: (rnd() * 2 - 1) * WEIGHT_INIT, enabled: true, innov: innovation(from, to) });
 }
 
 function nodeMutate(g) {
@@ -207,7 +299,7 @@ function pointMutate(g) {
   const step = g.rates.step;
   for (const gene of g.genes) {
     if (rnd() < PERTURB_CHANCE) gene.w += rnd() * step * 2 - step;
-    else gene.w = rnd() * 4 - 2;
+    else gene.w = (rnd() * 2 - 1) * WEIGHT_INIT * 2;
   }
 }
 
@@ -237,7 +329,7 @@ function mutate(g) {
    either parent, everything else from the fitter one. */
 function crossover(a, b) {
   if (b.fitness > a.fitness) { const t = a; a = b; b = t; }
-  const child = newGenome();
+  const child = emptyGenome();
   child.rates = { ...a.rates };
   const byInnov = new Map();
   for (const x of b.genes) byInnov.set(x.innov, x);
@@ -298,6 +390,9 @@ function evaluate(g) {
     conns: g.genes.filter(x => x.enabled).map(x => [x.from, x.to, x.w])
   });
   const rows = TRAIN_SEEDS.map(s => rollout(s, src, TICKS));
+  /* Each match builds a whole vm instance; without a nudge the resident
+     set walks past a gigabyte inside ten generations. */
+  if (global.gc && (evals % 24) === 0) global.gc();
   evals += rows.length;
   const f = rows.reduce((s, r) => s + shaped(r), 0) / rows.length;
   g.fitness = f; g.rows = rows;
@@ -330,7 +425,24 @@ const staleBook = [];
 
 let population = [];
 let species = [];
-let threshold = 3.0;
+/* The paper's delta_t = 3.0 assumes N normalises by genome size. With the
+   N = 1 rule in force (both genomes under 20 genes, which is the whole of
+   the early run) delta is just the RAW count of differing genes, and two
+   siblings that each took ~2.5 link mutations already differ by 5. A fixed
+   3.0 therefore puts almost every genome in its own species. In the other
+   direction, with the fully-connected start every genome carries 296
+   genes, N = 296, and delta collapses to 0.4 * mean|dw| ~ 0.16 -- one
+   species for everybody. Either way a fixed threshold is wrong, so it is
+   adapted multiplicatively to hold the species count near TARGET_SPECIES,
+   over a range reaching far below the paper's 3.0: once the population
+   shares an ancestor the disjoint terms nearly vanish and delta is
+   essentially 0.4 * mean|dw|, which between a parent and its mutated child
+   is about 0.02. A floor anywhere near 1.0 leaves everybody in one species
+   and switches pillar two off -- which is exactly what the first attempt
+   at this run did for two generations before it was noticed.
+   That is standard NEAT practice and it is the only deviation from the
+   paper's equation 1 here: E, D, Wbar and the N = 1 rule are all exact. */
+let threshold = 0.30;
 let gen0 = 0;
 let best = null;
 
@@ -345,30 +457,28 @@ if (resume) {
   for (const [k, v] of st.innovOf) innovOf.set(k, v);
   for (const [k, v] of st.splitOf) splitOf.set(Number(k), v);
   RNG = mulberry32(st.rngSeed);
-  console.log(`resumed from ${resume} at generation ${gen0}`);
+  say(`resumed from ${resume} at generation ${gen0}`);
 } else {
-  /* Minimal start: the empty genome, mutated. Two rounds rather than one
-     so the first generation has ~5 links to select between instead of
-     ~2 -- with a 37-input encoding a single random link is almost always
-     silent, and a generation of all-zero fitness is a generation
-     thrown away. */
-  for (let i = 0; i < POP; i++) population.push(mutate(mutate(newGenome())));
+  /* Minimal start: no hidden nodes, inputs wired straight to outputs. */
+  for (let i = 0; i < POP; i++) population.push(mutate(newGenome()));
 }
 
-console.log(`NEAT: pop ${POP}, ${TRAIN_SEEDS.length} seeds ${TRAIN_SEEDS}, ` +
+say(`NEAT: pop ${POP}, ${TRAIN_SEEDS.length} seeds ${TRAIN_SEEDS}, ` +
   `${TICKS} ticks (${(TICKS * FIXED).toFixed(0)}s) per match, ${GENS} generations`);
-console.log('gen  best   mean   spec  thr   links nodes   real-streak  kills deaths   evals  mins  rssMB');
+say('gen shapeW   best   mean  spec   thr  links nodes  streak  kills deaths   aim   evals  mins  rssMB');
 
 const t0 = Date.now();
 const history = [];
 
 for (let gen = gen0; gen < gen0 + GENS; gen++) {
+  shapeW = Math.max(0, 1 - gen / ANNEAL);
+  evalCache.clear();          // the objective moved; old scores are stale
   for (const g of population) evaluate(g);
 
   /* Speciate, then share fitness explicitly inside each species. */
   species = speciate(population, threshold);
-  if (species.length > TARGET_SPECIES + 1) threshold += 0.2;
-  else if (species.length < TARGET_SPECIES - 1) threshold = Math.max(0.4, threshold - 0.2);
+  if (species.length > TARGET_SPECIES + 1) threshold = Math.min(60, threshold * 1.2);
+  else if (species.length < TARGET_SPECIES - 1) threshold = Math.max(0.005, threshold / 1.2);
 
   for (const s of species) {
     s.members.sort((a, b) => b.fitness - a.fitness);
@@ -379,21 +489,25 @@ for (let gen = gen0; gen < gen0 + GENS; gen++) {
   species.sort((a, b) => b.top - a.top);
 
   const champ = species[0].members[0];
-  if (!best || champ.fitness > best.fitness) best = copyBest(champ);
+  /* `best` tracks the real streak, not the shaped score: the shaped score
+     is not comparable across generations once the annealing starts. */
+  if (!best || realStreakOf(champ) > best.real) best = copyBest(champ);
   const meanFit = population.reduce((a, g) => a + g.fitness, 0) / population.length;
   const realStreak = champ.rows.reduce((a, r) => a + r.streak, 0) / champ.rows.length;
   const kills = champ.rows.reduce((a, r) => a + r.kills, 0) / champ.rows.length;
   const deaths = champ.rows.reduce((a, r) => a + r.deaths, 0) / champ.rows.length;
+  const aim = champ.rows.reduce((a, r) => a + r.aim, 0) / champ.rows.length;
   const links = champ.genes.filter(x => x.enabled).length;
 
-  history.push({ gen, best: champ.fitness, mean: meanFit, species: species.length,
-    realStreak, kills, deaths, links, hidden: champ.hidden.length });
-  console.log(
-    `${String(gen).padStart(3)} ${champ.fitness.toFixed(2).padStart(6)} ` +
+  history.push({ gen, shapeW, best: champ.fitness, mean: meanFit, species: species.length,
+    realStreak, kills, deaths, aim, links, hidden: champ.hidden.length });
+  say(
+    `${String(gen).padStart(3)} ${shapeW.toFixed(2).padStart(6)} ${champ.fitness.toFixed(2).padStart(6)} ` +
     `${meanFit.toFixed(2).padStart(6)} ${String(species.length).padStart(5)} ` +
     `${threshold.toFixed(1).padStart(5)} ${String(links).padStart(6)} ` +
     `${String(champ.hidden.length).padStart(5)}   ${realStreak.toFixed(2).padStart(10)} ` +
     `${kills.toFixed(1).padStart(6)} ${deaths.toFixed(2).padStart(6)} ` +
+    `${aim.toFixed(2).padStart(5)} ` +
     `${String(evals).padStart(7)} ${((Date.now() - t0) / 60000).toFixed(1).padStart(5)} ` +
     `${(process.memoryUsage().rss / 1e6).toFixed(0).padStart(6)}`);
 
@@ -405,6 +519,7 @@ for (let gen = gen0; gen < gen0 + GENS; gen++) {
     population: population.map(g => ({ genes: g.genes, hidden: g.hidden, rates: g.rates, fitness: 0, shared: 0 }))
   }));
 
+  if (global.gc) global.gc();
   if (gen === gen0 + GENS - 1) break;
 
   /* ---- staleness: a species that has not improved in STALE_SPECIES
@@ -440,7 +555,7 @@ function breed(pool) {
 
 function copyBest(g) {
   const c = copyGenome(g);
-  c.fitness = g.fitness; c.rows = g.rows;
+  c.fitness = g.fitness; c.rows = g.rows; c.real = realStreakOf(g);
   return c;
 }
 
@@ -459,5 +574,5 @@ function stale(list, gen) {
   }
 }
 
-console.log(`\ndone: ${evals} matches in ${((Date.now() - t0) / 60000).toFixed(1)} min`);
-console.log(`best genome -> ${path.join(OUTDIR, 'best.json')}`);
+say(`\ndone: ${evals} matches in ${((Date.now() - t0) / 60000).toFixed(1)} min`);
+say(`best genome -> ${path.join(OUTDIR, 'best.json')}`);
