@@ -130,20 +130,66 @@
    against the hand-written U's 13.79. It is worth its 241 weights.
 
    ---------------------------------------------------------------------
-   RESULT: still does not beat the reactive policy, at any depth, trained or
-   not. Held out on seeds 1001-1020, 20 paired matches:
+   MOVING ENEMIES (the `blur` parameter, default OFF)
 
-       shipped              15.31   0.85 deaths    5/20 perfect
-       mcgs, hand U         13.79   1.25 deaths    5/20 perfect   4b/11w
-       mcgs, trained U      15.52   1.00 deaths    7/20 perfect   7b/9w
-       mcgs, trained U d2   17.08   0.85 deaths    9/20 perfect   7b/5w  p=0.77
+   The last suspect was that the model pinned every bot where it stood while
+   bots run at 5.3 m/s. The machinery above fixes that -- reach-dilated
+   visibility, staleness in the key -- and it changes nothing measurable.
+   Depth ablation on the dev seeds:
 
-   And the depth ablation, re-run after training, still shows nothing:
-   d1 12.08, d2 14.58, d3 12.29, d5 12.71 on the dev seeds -- no trend, just
-   noise. A good value function evaluated on a wrongly-imagined future state
-   is still wrong, and this forward model freezes the enemies where they
-   stand while they move at 5.3 m/s. That is the ceiling, and it is not a
-   ceiling more search or more training removes.
+       frozen   d1 16.25   d2 15.00   d3 10.42   d5 12.08
+       blurred  d1 13.63   d2 14.58   d3 13.21   d5 14.17
+
+   No trend either way. A much shorter atom (0.4 s, the scale the forensics
+   say deaths actually happen on) does not help either: 12.29 / 13.75 /
+   13.33 at depths 2 / 4 / 6 against 16.25 for the 1.4 s atom.
+
+   Blur is left in, parameterised and off. It doubles the replan cost
+   (~230 us -> ~500 us) to buy an effect that cannot be measured, and
+   `blur: 1` switches it on for anyone who wants to retry it with a metric
+   that can resolve it.
+
+   ---------------------------------------------------------------------
+   WHY NONE OF THOSE TABLES MEAN ANYTHING -- and the verdict
+
+   The decisive measurement is not any of them. It is this: perturb a
+   constant that CANNOT encode strategy and re-run the same ten seeds.
+
+       blur  1.000 -> fitness 16.25        dwell 1.400 -> 16.25
+       blur  1.002 -> fitness 17.50        dwell 1.410 -> 15.83
+
+   A two-parts-in-a-thousand change moves fitness by 1.25 and flips a match
+   from one death to none. This is not sampling noise; it is chaos. One
+   different movement decision at t = 12 s changes which bot walks around
+   which corner and the match diverges completely. The noise band on ten
+   seeds is +-1.3 fitness, and EVERY effect in every table above is inside
+   it -- including the 17.08 this file used to quote.
+
+   Held out on seeds 1001-1020, 20 paired matches:
+
+       shipped             15.31   0.85 deaths   5/20 perfect
+       mcgs (this file)    16.46   0.90 deaths   8/20 perfect   6b/5w  p=1.00
+       mcgs d2 blurred     13.75   1.10 deaths   4/20 perfect   5b/8w  p=0.58
+       mcgs d5 blurred     12.71   1.15 deaths   2/20 perfect   3b/8w  p=0.23
+
+   The arm as configured here is nominally ahead of the shipped policy and
+   the sign test on it is exactly 1.00. That is the honest summary of the
+   whole line of work: after a graph search, a trained value head and two
+   forward models, it is a coin flip.
+
+   VERDICT: macro-planning is exhausted on this problem. The elimination is
+   complete -- search was never the constraint (more of it scored worse),
+   the value function was the constraint inside the planner and training it
+   fixed that (held-out AUC 0.86, and it moved the arm from 13.79 to 15.52),
+   and the forward model was the constraint after that and fixing it changed
+   nothing. Depth has never paid, under a hand-written value or a trained
+   one, with frozen enemies or moving ones, at a 1.4 s atom or a 0.4 s one.
+
+   The deaths live somewhere no abstraction over regions and enemy sets can
+   see: 88% of them are a single damage event inside a 1-2 second window,
+   decided by who acquired whom first and by aim, which this state space
+   does not contain at any granularity. The next thing to try is not a
+   better planner. It is not a planner.
    ===================================================================== */
 
 function POLICY_BODY() {
@@ -197,7 +243,7 @@ function POLICY_BODY() {
     killW: 1.0, dmgW: 1.0, deathW: 6.0, riskW: 0.5, oppW: 0.25, hpW: 0.4,
     priorBeta: 1.6, planHz: 7, commitS: 0.7, fleeHp: 45, coverMul: 0.35,
     botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7,
-    netW: 6.0, blur: 1.0
+    netW: 6.0, blur: 0.0
   };
 
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -733,7 +779,12 @@ function POLICY_BODY() {
     /* the state we act FROM is as stale as this node is; the state we
        arrive in is staler still by the length of the action */
     const tb = node.tb;
-    const tb2 = Math.min(TB - 1, tb + Math.max(1, Math.round(T / tbSecs())));
+    /* With blur off the buckets carry no information, so collapse them --
+       it restores the cheaper key and the transpositions that splitting
+       states by staleness would otherwise throw away. */
+    const tb2 = P.blur > 0
+      ? Math.min(TB - 1, tb + Math.max(1, Math.round(T / tbSecs())))
+      : 0;
 
     let dmg = 0;
     if (move) {
@@ -1107,7 +1158,7 @@ function netLiteral() {
 
 module.exports = {
   name: 'mcgs',
-  describe: 'Monte-Carlo graph search over (region, enemy set, hp, ammo) with a trained P(death within 3s) value head',
+  describe: 'Monte-Carlo graph search, trained P(death within 3s) value head; a negative result -- depth never pays',
   netFile,
   policySource: () => netLiteral() + 'const POLICY = (' + POLICY_BODY.toString() + ')();'
 };
