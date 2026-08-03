@@ -88,7 +88,7 @@ module.exports = {
 
 /* A strategy directory collects helpers too -- diagnostics, sweeps, notes.
    Only files that are entries get entered; the rest are not failures. */
-const NOT_AN_ENTRY = /\.(analysis|test|util|helper|sweep)\.js$/;
+const NOT_AN_ENTRY = /\.(analysis|test|util|helper|sweep|arena|train)\.js$/;
 const files = fs.readdirSync(DIR)
   .filter(f => f.endsWith('.js') && !NOT_AN_ENTRY.test(f))
   .filter(f => !ONLY || ONLY.some(n => f === n || f === n + '.js' || f === '_' + n + '.js'))

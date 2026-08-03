@@ -70,6 +70,30 @@
      lets self-play move the policy, and lets the divergence show up in the
      numbers rather than being defined away.
 
+   WHAT THE FIRST RUN OF THIS FILE FOUND (3 generations, 176 arena games)
+   ----------------------------------------------------------------------
+   The promotion rule above is TOO LOOSE and the run proved it. g1c1 was
+   promoted on a 16-game gauntlet at pair score 0.625 (5w/3l, sign p=0.727),
+   then re-played against the same opponent on a disjoint block of 24 mirrored
+   pairs: score 0.271, mean pair margin -6.23, sd 10.25, sign p=0.035. The
+   promoted challenger is significantly WORSE.
+
+   The pair margin has sd ~10 kills, so the standard error of a duel is
+   10/sqrt(pairs): 3.6 at 8 pairs, 2.0 at 24. Detecting the size of effect a
+   10% parameter jitter produces (a few kills) needs 24+ mirrored pairs per
+   opponent — ~3.5 CPU-minutes a duel, ~|pool| x that a gauntlet. Any future
+   run of this file should use GAUNTLET_PAIRS >= 24 and read the t on the mean
+   pair margin, not the win count: the sign of the pair margin throws away the
+   magnitude, and magnitude is where the information is.
+
+   And the divergence the brief warned about is real and points the other way
+   from the naive fear: across the 8 candidates screened here, self-play
+   margin against fixed-bot fitness came out at pearson r = -0.374, spearman
+   rho = -0.262, and the one candidate measured on the tournament's held-out
+   window was worse in self-play (p=0.035) and better on fixed bots (18.52 vs
+   15.02, 10b/4w/10t, p=0.180). Self-play here is not a proxy for the
+   tournament. Report both, always.
+
    Usage:
      node tools/strategies/selfplay.sweep.js null   [pairs]
      node tools/strategies/selfplay.sweep.js league [gens] [lambda]
@@ -301,7 +325,7 @@ function cmdLeague(gens, lambda) {
   const rng = mulberry32(20260803 + st.matches * 7919);
   const devSeeds = Array.from({ length: 8 }, (_, i) => 1 + i);
   const vecOf = name => st.pool.find(m => m.name === name).vec;
-  const SCREEN_PAIRS = 5, GAUNTLET_PAIRS = 8;
+  const SCREEN_PAIRS = 5, GAUNTLET_PAIRS = 8;   // see the header: 8 is too few
   const t0 = Date.now();
   const spent = () => `${((Date.now() - t0) / 1000).toFixed(0)}s`;
 

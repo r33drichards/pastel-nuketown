@@ -333,5 +333,37 @@
       "promote": false,
       "gen": 2
     }
-  ]
+  ],
+  "confirmations": [
+    {
+      "a": "g1c1",
+      "b": "gen0",
+      "pairs": 24,
+      "games": 48,
+      "score": 0.271,
+      "meanPairMargin": -6.23,
+      "sd": 10.25,
+      "signP": 0.035,
+      "note": "fresh seeds 70000+17i; the gen-0 promotion does not survive at 3x power. League incumbent reverts to gen0."
+    }
+  ],
+  "heldOut": [
+    {
+      "arm": "g1c1",
+      "seeds": "1001..1024",
+      "fitness": 18.524,
+      "shipped": 15.017,
+      "better": 10,
+      "worse": 4,
+      "ties": 10,
+      "signP": 0.18
+    }
+  ],
+  "divergence": {
+    "candidates": 8,
+    "devSeeds": 8,
+    "pearson": -0.374,
+    "spearman": -0.262
+  },
+  "incumbentAfterConfirmation": "gen0"
 }
