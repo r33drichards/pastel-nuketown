@@ -73,13 +73,14 @@ const POLICY = (() => {
     'switchMargin',  // a rival must beat the held goal by this to take over
     'commitTime',    // seconds a goal is held no matter what
     'hurtBoost',     // extra threat weight at zero health (0 = ignore health)
-    'shieldHold'     // seconds of the spawn bubble to spend moving, not shooting
+    'shieldHold',    // seconds of the spawn bubble to spend moving, not shooting
+    'fieldAt'        // watchers on ME before the field takes the body over
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
     [0, 1], [4, 40], [0, 0.9], [0.8, 2.0], [0.5, 6],
     [0, 40], [1, 3], [0, 20], [0, 30], [0, 3],
-    [5, 60], [2, 30], [0, 3], [0, 8], [0, 3], [0, 4], [0, 1.6]
+    [5, 60], [2, 30], [0, 3], [0, 8], [0, 3], [0, 4], [0, 1.6], [0, 4]
   ];
   const P = {
     /* the shipped tuned vector, so the policy is correct even if nobody
@@ -91,7 +92,7 @@ const POLICY = (() => {
     /* ---- FIELD WEIGHTS ---- */
     wThreat: 9.0, threatExp: 1.75, wCover: 3.0, wOpp: 7.0, wTravel: 0.45,
     threatDecay: 22.0, oppBand: 9.0, wPress: 0.60, switchMargin: 1.5,
-    commitTime: 0.55, hurtBoost: 1.0, shieldHold: 0
+    commitTime: 0.55, hurtBoost: 1.0, shieldHold: 0, fieldAt: 0
   };
 
   /* ---- structural constants: shape of the search, not tuning knobs ---- */
@@ -332,6 +333,19 @@ const POLICY = (() => {
 
   /* ---- commitment state ---- */
   let goalId = -1, goalSince = -1e9, steer = null, holding = false;
+  let fieldOn = true, fieldSince = -1e9;
+
+  /* How many living enemies can see ME, right now. Six line-of-sight tests;
+     the field already pays hundreds. */
+  function watchersOnMe(me) {
+    let w = 0;
+    const ey = me.pos.y + EYE;
+    for (let i = 0; i < foes.length; i++) {
+      const e = foes[i];
+      if (losClear(me.pos.x, ey, me.pos.z, e.pos.x, e.pos.y + 1.60, e.pos.z)) w++;
+    }
+    return w;
+  }
 
   function replan(me, G, target) {
     const startId = nav.nearest(me.pos.x, me.pos.y, me.pos.z);
@@ -347,6 +361,20 @@ const POLICY = (() => {
     const threatW = P.wThreat * (1 + P.hurtBoost * (1 - hp));
     pressOn = !!target;
     if (target) { pressX = target.pos.x; pressZ = target.pos.z; }
+
+    /* Should the field drive at all? With fieldAt = 0 it always does. Above
+       zero it only takes over once that many enemies can see the bot, and the
+       shipped range-keeping body runs the rest of the time — the point being
+       that the shipped body is faster to 25 kills and the field's measured
+       benefit is concentrated in the moments where several people have an
+       angle. Latched for commitTime so the two bodies cannot alternate on a
+       watcher blinking in and out of a doorway. */
+    if (P.fieldAt > 0) {
+      const w = watchersOnMe(me);
+      if (w >= P.fieldAt) { fieldOn = true; fieldSince = t; }
+      else if (fieldOn && t - fieldSince > P.commitTime) { fieldOn = false; }
+      if (!fieldOn) { goalId = -1; steer = null; return; }
+    } else fieldOn = true;
 
     const nodes = nav.nodes;
     let bestId = -1, bestScore = Infinity;
@@ -424,7 +452,7 @@ const POLICY = (() => {
     reset() {
       t = 0; phase = 0; strafeSign = 1; tick = 0;
       goalId = -1; goalSince = -1e9; steer = null; holding = false;
-      navTries = 0;
+      fieldOn = true; fieldSince = -1e9; navTries = 0;
     },
 
     act(me, G, dt) {
@@ -476,13 +504,14 @@ const POLICY = (() => {
         if (f > 0.383) fwd = 1; else if (f < -0.383) fwd = -1;
         if (r > 0.383) strafe = 1; else if (r < -0.383) strafe = -1;
         if (!fwd && !strafe) fwd = f >= 0 ? 1 : -1;
-      } else if (nav) {
+      } else if (nav && fieldOn) {
         /* Standing on the chosen node: strafe rather than stand still, and
            let the next recompute pull the drift back. Most damage is taken
            by a stationary silhouette. */
         strafe = visible ? strafeSign * P.strafeAmount : 0;
       } else {
-        /* No nav graph — fall back to the shipped range-keeping body. */
+        /* Field off (gated out, or no nav graph) — the shipped range-keeping
+           body, verbatim. */
         if (tdist > P.engageRange + P.rangeBand) fwd = 1;
         else if (tdist < P.engageRange - P.rangeBand) fwd = -1;
         strafe = visible ? strafeSign * P.strafeAmount : 0;

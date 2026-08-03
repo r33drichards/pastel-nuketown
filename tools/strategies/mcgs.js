@@ -40,7 +40,11 @@
    coarse cell -- about 90 of them, mean degree ~4.3. Discrete, hashable,
    and genuinely transposition-rich: "north window, four enemies left, half
    health" is reached by many different routes and every one of them wants
-   the same answer.
+   the same answer. Measured, over a match: 30% of the search's node lookups
+   land on a node another path already built (866 hits / 2871 lookups). So
+   the graph is doing the thing a graph is for -- it is just not enough to
+   make the plan good, because the plan's problem is its model, not its
+   bookkeeping.
 
    ---------------------------------------------------------------------
    CYCLES
@@ -75,7 +79,37 @@
    is the shipped reactive policy with its tuned vector -- same target
    pick, same capped turn, same fire cone, same strafe, same reload -- and
    only its MOVEMENT direction is taken from the goal. When the planner says
-   "engage" the controller is bit-for-bit the shipped policy.
+   "engage" the controller is bit-for-bit the shipped policy. That is checked,
+   not assumed: with `stayBias` forced high the planner always answers
+   "engage", and the arm then tracks the shipped policy's position, yaw, keys
+   and trigger for 3000 straight ticks with no divergence at all.
+
+   ---------------------------------------------------------------------
+   COST (measured, node, seeds 2 and 9)
+
+     one replan, 128 sims x depth 5      200-330 us
+     replans actually issued             0.065 per 60 Hz tick
+     amortised planner cost              ~17 us per tick
+     one-off region-visibility matrix    ~2900 rays, ~116 ms, paid lazily in
+                                         ~90-ray (3.6 ms) slices during play
+
+   For scale, the shipped policy's own pickTarget spends eight canSee calls
+   -- about 320 us -- on EVERY tick, and a whole simulation tick costs about
+   1130 us. The planner is roughly 1.5% of a tick. This fits a browser.
+
+   The single thing that made it fit was killing the raycasts: a first cut
+   asked canSee per (region, enemy) inside the search and cost 4-5 ms a
+   replan. canSee is ~40 us. Region-to-region visibility is static, so it is
+   a matrix, and the search became pure arithmetic.
+
+   ---------------------------------------------------------------------
+   RESULT: it does not beat the reactive policy. See the report; the short
+   version is that 10 seeds of tuning gains vanished on 10 held-out seeds,
+   more search made it no better (256 sims scored worse than 128, and depth 2
+   scored the same as depth 5), and the reason is almost certainly that the
+   forward model freezes the enemies where they stand -- which is wrong by
+   10-20 m by the second macro-step, so there is nothing there for depth to
+   find.
    ===================================================================== */
 
 function POLICY_BODY() {
@@ -451,7 +485,8 @@ function POLICY_BODY() {
 
   function getNode(key, r, mask, hp, ammo) {
     let n = table.get(key);
-    if (n) return n;
+    if (n) { STATS.hits++; return n; }
+    STATS.miss++;
     n = {
       key, r, mask, hp, ammo,
       U: evalState(r, mask, hp, ammo),
@@ -609,7 +644,7 @@ function POLICY_BODY() {
      ================================================================= */
   const GOAL = { node: -1, region: -1, stance: 'engage', at: -1 };
   const PATHSET = new Set();
-  let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0 };
+  let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0, hits: 0, miss: 0 };
 
   function runPlan(me, G) {
     const nav = ensureNav(G);
@@ -718,7 +753,7 @@ function POLICY_BODY() {
       path = null; pathI = 0; pathGoal = -1;
       GOAL.node = -1; GOAL.region = -1; GOAL.stance = 'engage';
       table.clear();
-      STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0 };
+      STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0, hits: 0, miss: 0 };
     },
     stats: () => STATS,
     /* for the offline timer: run the search n times, nothing else */
