@@ -678,7 +678,16 @@ const POLICY = (() => {
       const store = loadout[this.id] || this.untouched;
       return store.ammo + store.reserve;
     }
-    dry(loadout) { return this.rounds(loadout) <= 0; }
+    /* Spent: the policy is asking this gun for a reload it cannot give. It
+       calls tryReload every tick once the magazine drops past reloadAt, and
+       tryReload bails at once on an empty reserve — so the bot stands there
+       asking forever. The rounds still in the magazine are not a reason to
+       keep carrying it: it fires those off and goes back to asking, while a
+       full gun rides on its back. */
+    spent(loadout) {
+      const store = loadout[this.id] || this.untouched;
+      return store.reserve <= 0 && store.ammo <= this.spec.mag * RELOAD_AT;
+    }
     /* switchWeapon returns early when this gun is already in hand, so equip is
        a no-op on every tick but the one that changes weapons. It cannot eat a
        reload either: reloading requires reserve > 0, which is rounds to spare,
@@ -704,11 +713,17 @@ const POLICY = (() => {
     ready(me) { return super.ready(me) && me.fireCd <= 0; }
   }
 
-  /* Nothing left to shoot with, so the tick never has to ask whether the
-     arsenal found it a gun. */
+  /* Not a gun, for the tick that has no gun to hand — it holds the trigger
+     shut rather than making the caller ask whether it found one. */
   const EMPTY_HANDED = {
-    rounds: () => 0, dry: () => true, equip() {}, trigger: () => false
+    rounds: () => 0, spent: () => true, equip() {}, trigger: () => false
   };
+
+  /* The magazine fraction the policy reloads at, read through the published
+     parameter names rather than by position: the vector is positional, the
+     names are the contract. Zero if this policy has no such knob, which makes
+     `spent` mean simply empty. */
+  const RELOAD_AT = POLICY.getParams()[POLICY.PARAM_NAMES.indexOf('reloadAt')] || 0;
 
   /* The game's own `auto` flag picks the class. This is the only place the two
      kinds of trigger are told apart. */
@@ -722,9 +737,13 @@ const POLICY = (() => {
   const loadoutOf = me =>
     Object.assign({}, me._ammoBy, { [me.weapon]: { ammo: me.ammo, reserve: me.reserve } });
   const inHand = me => ARSENAL.find(w => w.id === me.weapon) || EMPTY_HANDED;
+  /* First gun still worth carrying; failing that, whichever holds the most
+     rounds, so the last few in a spent magazine still get fired rather than
+     carried around. */
   const bestFor = me => {
     const loadout = loadoutOf(me);
-    return ARSENAL.find(w => !w.dry(loadout)) || EMPTY_HANDED;
+    return ARSENAL.find(w => !w.spent(loadout)) ||
+           ARSENAL.reduce((a, b) => b.rounds(loadout) > a.rounds(loadout) ? b : a);
   };
 
   /* pressFire/releaseFire rather than poking IN.firing: they own the fireSeq
