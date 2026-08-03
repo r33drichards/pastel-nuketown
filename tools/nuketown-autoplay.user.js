@@ -545,16 +545,18 @@ const POLICY = (() => {
     'sprintRange',   // metres: sprint when further than this from the target
     'reloadAt',      // reload when the magazine drops to this fraction
     'aimHeight',     // metres above the target's feet to aim
-    'searchTurn'     // radians/second to sweep when nothing is visible
+    'searchTurn',    // radians/second to sweep when nothing is visible
+    'coneSlack'      // multiples of the target's own angular width to fire within
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
-    [0, 1], [4, 40], [0, 0.9], [0.8, 2.0], [0.5, 6]
+    [0, 1], [4, 40], [0, 0.9], [0.8, 2.0], [0.5, 6],
+    [0.3, 6]
   ];
   const P = {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
     strafePeriod: 1.1, strafeAmount: 0.8, sprintRange: 18,
-    reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0
+    reloadAt: 0.0, aimHeight: 1.5, searchTurn: 2.0, coneSlack: 1.6
   };
 
   let t = 0, strafeSign = 1, phase = 0;
@@ -623,15 +625,28 @@ const POLICY = (() => {
       if (phase >= 1) { phase = 0; strafeSign = -strafeSign; }
       const strafe = visible ? strafeSign * P.strafeAmount : 0;
 
-      const onTarget = Math.abs(dYaw) < P.fireCone && Math.abs(dPitch) < P.fireCone;
+      /* Fire when the crosshair is on the target, not merely within a fixed
+         angle of it. A body is HIT.bodyR across, which at 24 m subtends 0.015
+         radians, against a constant gate of 0.104 — so the gate said yes for
+         most of the sweep onto a target, and the rounds that went out during
+         it could not have landed. The gate is that angular half-width times
+         coneSlack now, still capped by fireCone so it cannot open wider than
+         the tuned value at point-blank range. */
+      const w = WBY[me.weapon] || WBY.smg;
+      const halfWidth = Math.atan2(HIT.bodyR, Math.max(0.5, dist));
+      const cone = Math.min(P.fireCone, P.coneSlack * halfWidth);
+      const onTarget = Math.abs(dYaw) < cone && Math.abs(dPitch) < cone;
+      /* Past w.range the hitscan stops short of the target, so the shot is
+         spent before it arrives. Matters for the shotgun, which reaches 34 m
+         while this policy likes to engage at 24. */
+      const inRange = dist <= w.range;
       const hasAmmo = me.ammo > 0;
-      const mag = (WBY[me.weapon] && WBY[me.weapon].mag) || 30;
-      if (!hasAmmo || me.ammo / mag <= P.reloadAt) tryReload(me);
+      if (!hasAmmo || me.ammo / w.mag <= P.reloadAt) tryReload(me);
 
       return {
         fwd, strafe,
         sprint: dist > P.sprintRange && !visible,
-        fire: visible && onTarget && hasAmmo,
+        fire: visible && onTarget && inRange && hasAmmo,
         yaw, pitch
       };
     }
@@ -651,7 +666,13 @@ const POLICY = (() => {
   if (typeof POLICY === 'undefined' || !POLICY || typeof POLICY.act !== 'function') {
     console.error('[auto] policy failed to install'); return;
   }
-  POLICY.setParams([24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332]);
+  /* Positional, so a vector of the wrong length is rejected outright rather
+     than silently reinterpreted — and a rejected vector means the policy runs
+     on its untuned defaults, which is worth a shout rather than a shrug. */
+  if (!POLICY.setParams(
+      [24.030481,2.256479,0.103612,22.140736,1.897986,0.634428,12.297849,0.177887,1.575976,3.160332,1.6])) {
+    console.error('[auto] parameter vector rejected — the policy is running untuned');
+  }
 
   /* ---- the arsenal ----------------------------------------------------
      The vector was tuned for the smg, so that stays the first choice. But
