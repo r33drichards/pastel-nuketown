@@ -86,21 +86,24 @@ function extensionSource(vec) {
 
     /* One pass for both questions: who is the nearest enemy that can see me,
        and how many of them there are. Line of sight is symmetric here --
-       canSee is a ray against the map -- so the same test answers both. */
+       canSee is a ray against the map -- so the same test answers both.
+       Only inside breakRange: a rifle across the whole map is not what makes
+       this policy die, and the ray is the expensive part of the tick. */
     let tgt = null, td = Infinity, los = 0;
     const ex = me.pos.x, ey = actorEye(me), ez = me.pos.z;
     for (const a of G.actors) {
       if (a === me || a.isPlayer || !a.alive) continue;
+      const d = Math.hypot(a.pos.x - ex, a.pos.z - ez);
+      if (d > X.breakRange) continue;
       if (!canSee(ex, ey, ez, a.pos.x, actorEye(a), a.pos.z)) continue;
       los++;
-      const d = Math.hypot(a.pos.x - ex, a.pos.z - ez);
       if (d < td) { td = d; tgt = a; }
     }
     if (!tgt) return out;
 
     const hurt = X.hurtHealth > 0 && me.health < X.hurtHealth;
     const swarmed = los >= X.losThreat;
-    if (!(hurt || swarmed) || td > X.breakRange) return out;
+    if (!(hurt || swarmed)) return out;
 
     /* Where the body goes: straight away from the nearest gun. */
     let ax = ex - tgt.pos.x, az = ez - tgt.pos.z;

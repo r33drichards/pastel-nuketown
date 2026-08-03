@@ -181,6 +181,9 @@ var FDATA = {
   respawnActor = function (a) {
     const out = _respawn.apply(this, arguments);
     if (a === G.player) { spawnAt = G.time; RING.length = 0; damageLog.length = 0; }
+    /* A bot that respawns is somewhere else entirely, so whatever line of
+       sight it held before it died is not the one it holds now. */
+    else losSince[a.id] = Infinity;
     return out;
   };
 
@@ -481,15 +484,19 @@ function report(rows, opts) {
   console.log('  RELATIVE RISK  (share of deaths vs share of ordinary alive time)');
   console.log('  ' + 'factor'.padEnd(34) + 'at death   baseline   risk x');
   const rr = (label, atDeath, baseline) => {
-    const x = baseline > 0 ? atDeath / baseline : Infinity;
-    console.log('  ' + label.padEnd(34) + pct(atDeath).padStart(8) + pct(baseline).padStart(11) +
-      (isFinite(x) ? x.toFixed(2).padStart(9) : '      inf') +
-      (x >= 2 ? '   <<<' : (x <= 0.5 ? '   (protective)' : '')));
+    const has = isFinite(baseline);
+    const x = has && baseline > 0 ? atDeath / baseline : NaN;
+    const flag = !isFinite(x) ? '' :
+      (x >= 2 && atDeath >= 0.1 ? '   <<<' : (x <= 0.5 && baseline >= 0.05 ? '   (protective)' : ''));
+    console.log('  ' + label.padEnd(34) + pct(atDeath).padStart(8) +
+      (has ? pct(baseline) : '    -').padStart(11) +
+      (isFinite(x) ? x.toFixed(2).padStart(9) : '        -') + flag);
   };
   rr('reloading', deaths.filter(d => d.reloading).length / n, base.reload / A);
   rr('magazine <=20%', deaths.filter(d => d.ammo <= 6).length / n, base.lowAmmo / A);
   rr('dry (ammo 0)', deaths.filter(d => d.ammo === 0).length / n, base.dry / A);
   rr('swapped weapon in last 1s', deaths.filter(d => d.sinceSwap < 1).length / n, NaN);
+  rr('had fired within the last 0.5s', deaths.filter(d => d.sinceOwnShot < 0.5).length / n, NaN);
   rr('0 enemies with LOS', deaths.filter(d => d.los === 0).length / n, base.los0 / A);
   rr('exactly 1 enemy with LOS', deaths.filter(d => d.los === 1).length / n, base.los1 / A);
   rr('2+ enemies with LOS', deaths.filter(d => d.los >= 2).length / n, (base.los2 + base.los3) / A);
@@ -575,6 +582,20 @@ function report(rows, opts) {
 
   /* ---- classification ---- */
   console.log('');
+  console.log('  WHAT THE FATAL BURST LOOKED LIKE');
+  console.log(`    killed by a single damage event:   ${pct(deaths.filter(d => d.oneShot).length / n)}` +
+    `   by <=2 events: ${pct(deaths.filter(d => d.engHits <= 2).length / n)}`);
+  console.log(`    fatal blow was a headshot:         ${pct(deaths.filter(d => d.fatalHead).length / n)}`);
+  console.log(`    damage events in the fatal engagement: median ${num(quantiles(deaths.map(d => d.engHits)).p50, 1)}` +
+    `   mean ${num(quantiles(deaths.map(d => d.engHits)).mean, 1)}`);
+  const held = quantiles(deaths.map(d => d.killerLosHeld));
+  console.log(`    seconds the killer had held unbroken LOS when it fired the fatal shot:`);
+  console.log(`      p10 ${num(held.p10)}  median ${num(held.p50)}  p90 ${num(held.p90)}  mean ${num(held.mean)}`);
+  console.log(histogram(deaths.map(d => d.killerLosHeld), [0.25, 0.6, 1.2, 2.5], 'killer LOS-hold at the moment of death (s)'));
+  console.log(`    the player had 2+ enemies in LOS for ${num(quantiles(deaths.map(d => d.twoLosHeld)).p50)}s (median) before dying`);
+  console.log(`    the policy had fired within 0.5s of dying: ${pct(deaths.filter(d => d.sinceOwnShot < 0.5).length / n)}`);
+
+  console.log('');
   console.log('  CLASSIFICATION');
   /* Deliberately conservative definitions, both stated in full so the number
      can be argued with rather than taken on trust. */
@@ -584,25 +605,35 @@ function report(rows, opts) {
   const isBurst = d => d.engFrom !== null && d.engFrom <= 1.0 && d.hpAtEngStart >= 90;
   const hadWarning = d => d.lowFor >= 1.0;
   const crossfire = d => d.engAttackers >= 2;
-  console.log(`    REACTIVE-ambush   (<=0.8s under fire, from full health, killer not seen in the last 0.5s): ${pct(deaths.filter(isAmbush).length / n)}`);
-  console.log(`    REACTIVE-burst    (<=1.0s under fire, from full health, seen or not):                      ${pct(deaths.filter(isBurst).length / n)}`);
-  console.log(`    STRATEGIC-warned  (spent >=1.0s under 50 hp and stayed):                                   ${pct(deaths.filter(hadWarning).length / n)}`);
-  console.log(`    crossfire (2+ attackers landed damage):                                                    ${pct(deaths.filter(crossfire).length / n)}`);
-  console.log(`    both fast AND from full health AND single attacker:                                        ${pct(deaths.filter(d => isBurst(d) && d.engAttackers === 1).length / n)}`);
+  /* The one that decides the project: could a policy watching its own health
+     have done anything? It needs the damage to arrive slowly enough to react
+     to (>= ~0.5 s, two ticks of decision plus a step) AND a reachable place to
+     go. */
+  const actionable = d => d.engFrom !== null && d.engFrom >= 0.6 && d.hpAtEngStart >= 40;
+  const p = f => pct(deaths.filter(f).length / n);
+  console.log(`    REACTIVE-ambush   (<=0.8s under fire, from full health, killer not seen in the last 0.5s): ${p(isAmbush)}`);
+  console.log(`    REACTIVE-burst    (<=1.0s under fire, from full health, seen or not):                      ${p(isBurst)}`);
+  console.log(`    STRATEGIC-warned  (spent >=1.0s under 50 hp and stayed):                                   ${p(hadWarning)}`);
+  console.log(`    crossfire (2+ attackers landed damage):                                                    ${p(crossfire)}`);
+  console.log(`    both fast AND from full health AND single attacker:                                        ${p(d => isBurst(d) && d.engAttackers === 1)}`);
+  console.log(`    ACTIONABLE (>=0.6s of incoming damage before dying — long enough to disengage):            ${p(actionable)}`);
+  console.log(`    killer had held LOS >=1.0s before the fatal shot (it was standing there in view):          ${p(d => d.killerLosHeld >= 1.0)}`);
+  console.log(`    killer acquired LOS <0.25s before the fatal shot (it stepped into view):                   ${p(d => d.killerLosHeld < 0.25)}`);
 
   if (opts.dump) {
     console.log('');
     console.log('  EVERY DEATH');
-    console.log('  seed    t  spawn+   hp-2s hp-1s  killer            dist  los  atk  ttd   cover/avail  rl  ammo  spd');
+    console.log('  seed    t  spawn+  hp-2s hp-1s  killer                dist los atk hits  ttd  losHeld  cover/avail rl ammo  spd');
     for (const d of deaths) {
+      const hpc = v => String(v === null || v === undefined ? '-' : Math.round(v)).padStart(5);
       console.log(`  ${String(d.seed).padStart(4)} ${num(d.t, 0).padStart(4)} ${num(d.sinceSpawn, 1).padStart(6)}  ` +
-        `${String(d.hp.t2_0 === null ? '-' : Math.round(d.hp.t2_0)).padStart(5)} ` +
-        `${String(d.hp.t1_0 === null ? '-' : Math.round(d.hp.t1_0)).padStart(5)}  ` +
-        `${String((d.killerName || '?') + '/' + (d.killerSkill || '?') + '/' + (d.killerWeapon || '?')).padEnd(20)}` +
-        `${num(d.dist, 1).padStart(5)} ${String(d.los).padStart(4)} ${String(d.engAttackers).padStart(4)} ` +
-        `${num(d.engFrom, 2).padStart(5)}  ${num(d.cover, 2)}/${num(d.coverAvail, 2)}  ` +
-        `${d.reloading ? 'R ' : '. '} ${String(d.ammo).padStart(4)} ${num(d.speed, 1).padStart(5)}` +
-        `${d.killerWasTarget ? '  TGT' : ''}`);
+        `${hpc(d.hp.t2_0)} ${hpc(d.hp.t1_0)}  ` +
+        `${String((d.killerName || '?') + '/' + (d.killerSkill || '?') + '/' + (d.killerWeapon || '?')).padEnd(22)}` +
+        `${num(d.dist, 1).padStart(5)} ${String(d.los).padStart(3)} ${String(d.engAttackers).padStart(3)} ` +
+        `${String(d.engHits).padStart(4)} ${num(d.engFrom, 2).padStart(5)} ` +
+        `${num(d.killerLosHeld, 2).padStart(7)}  ${num(d.cover, 2)}/${num(d.coverAvail, 2)}  ` +
+        `${d.reloading ? 'R' : '.'} ${String(d.ammo).padStart(4)} ${num(d.speed, 1).padStart(5)}` +
+        `${d.killerWasTarget ? ' TGT' : ''}${d.fatalHead ? ' HEAD' : ''}`);
     }
   }
   return deaths;

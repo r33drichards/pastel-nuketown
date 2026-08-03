@@ -41,6 +41,10 @@ if (process.argv[2] === '--worker') {
   const seeds = JSON.parse(process.argv[4]);
   const { runMatch } = require('./eval-policy.js');
   const strat = require(file);
+  if (!strat || typeof strat.policySource !== 'function') {
+    console.error(`${path.basename(file)} does not export policySource() — see strategies/README.md`);
+    process.exit(2);
+  }
   const source = strat.policySource();
   const rows = [];
   for (const seed of seeds) {
@@ -73,8 +77,11 @@ module.exports = {
 `);
 }
 
+/* A strategy directory collects helpers too -- diagnostics, sweeps, notes.
+   Only files that are entries get entered; the rest are not failures. */
+const NOT_AN_ENTRY = /\.(analysis|test|util|helper|sweep)\.js$/;
 const files = fs.readdirSync(DIR)
-  .filter(f => f.endsWith('.js'))
+  .filter(f => f.endsWith('.js') && !NOT_AN_ENTRY.test(f))
   .filter(f => !ONLY || ONLY.some(n => f === n || f === n + '.js' || f === '_' + n + '.js'))
   .map(f => path.join(DIR, f));
 
@@ -95,6 +102,7 @@ function launch() {
       { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
     let stderr = '';
     w.stderr.on('data', d => { stderr += d.toString(); });
+    const lastLines = n => stderr.trim().split('\n').filter(Boolean).slice(-n).join(' | ');
     const kill = setTimeout(() => { w.kill('SIGKILL'); }, MATCH_TIMEOUT_MS);
     let payload = null;
     w.on('message', m => { if (m.done) payload = m; });
@@ -105,9 +113,9 @@ function launch() {
         results.push({ ...payload, file: path.basename(file), ms: Date.now() - started });
         console.log(`  ok    ${payload.name}`);
       } else {
-        results.push({ name: path.basename(file, '.js'), failed: true,
-          error: (stderr.trim().split('\n').pop() || `exit ${code}`).slice(0, 200) });
-        console.log(`  FAIL  ${path.basename(file)} — ${(stderr.trim().split('\n').pop() || '').slice(0, 120)}`);
+        const why = lastLines(3) || `exit ${code}`;
+        results.push({ name: path.basename(file, '.js'), failed: true, error: why.slice(0, 400) });
+        console.log(`  FAIL  ${path.basename(file)} — ${why.slice(0, 160)}`);
       }
       if (running === 0 && next >= files.length) finish();
       else launch();
