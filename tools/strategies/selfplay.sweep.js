@@ -417,12 +417,19 @@ function pearson(a, b) {
    against the eight fixed bots, whose threat model (a `hard` rifle bot
    landing a one-shot headshot) is nothing like a lobby full of SMG policies.
    --------------------------------------------------------------------- */
-function cmdHoldout(n, first) {
+function cmdHoldout(n, first, who) {
   const seeds = Array.from({ length: n }, (_, i) => first + i);
-  const arms = [
-    { name: 'shipped', source: SHIPPED_SRC },
-    { name: 'selfplay', source: require('./selfplay.js').policySource() }
-  ];
+  let arm;
+  if (!who || who === 'selfplay') {
+    arm = { name: 'selfplay', source: require('./selfplay.js').policySource() };
+  } else {
+    const st = loadState();
+    const m = st.pool.find(x => x.name === who) ||
+      st.log.find(x => x.name === who);
+    if (!m) throw new Error('no such candidate: ' + who);
+    arm = { name: who, source: sourceOf(m.vec) };
+  }
+  const arms = [{ name: 'shipped', source: SHIPPED_SRC }, arm];
   const out = arms.map(a => ({ name: a.name, rows: seeds.map(s => {
     const r = runMatch(s, { policySource: a.source });
     process.stdout.write('.');
@@ -441,14 +448,14 @@ function cmdHoldout(n, first) {
   const per = [];
   for (let i = 0; i < n; i++) {
     const b = out[0].rows[i].streak, x = out[1].rows[i].streak;
-    per.push({ seed: seeds[i], shipped: b, selfplay: x });
+    per.push({ seed: seeds[i], shipped: b, arm: x });
     if (x > b) better++; else if (x < b) worse++;
   }
-  console.log(`\n  selfplay vs shipped, paired on seeds ${first}..${first + n - 1}: ` +
+  console.log(`\n  ${arm.name} vs shipped, paired on seeds ${first}..${first + n - 1}: ` +
     `${better}b/${worse}w/${n - better - worse}t   p=${signTest(better, worse).toFixed(3)}`);
   for (const r of per) {
     console.log(`    seed ${r.seed}  shipped ${r.shipped.toFixed(2).padStart(6)}  ` +
-      `selfplay ${r.selfplay.toFixed(2).padStart(6)}  ${r.selfplay > r.shipped ? '+' : (r.selfplay < r.shipped ? '-' : '=')}`);
+      `${arm.name} ${r.arm.toFixed(2).padStart(6)}  ${r.arm > r.shipped ? '+' : (r.arm < r.shipped ? '-' : '=')}`);
   }
 }
 
@@ -543,7 +550,7 @@ if (require.main === module) {
   else if (cmd === 'league') cmdLeague(Number(process.argv[3] || 3), Number(process.argv[4] || 4));
   else if (cmd === 'head') cmdHead(process.argv[3], process.argv[4], Number(process.argv[5] || 8));
   else if (cmd === 'confirm') cmdConfirm(process.argv[3], process.argv[4], Number(process.argv[5] || 24));
-  else if (cmd === 'holdout') cmdHoldout(Number(process.argv[3] || 24), Number(process.argv[4] || 1001));
+  else if (cmd === 'holdout') cmdHoldout(Number(process.argv[3] || 24), Number(process.argv[4] || 1001), process.argv[5]);
   else if (cmd === 'divergence') cmdDivergence(Number(process.argv[3] || 8));
   else { console.error('unknown command ' + cmd); process.exit(2); }
 }

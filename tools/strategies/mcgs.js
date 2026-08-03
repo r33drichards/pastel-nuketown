@@ -177,7 +177,9 @@ function POLICY_BODY() {
     'stayBias',    // reward added to "stand and fight"; large = never replan
     'breakLook',   // 1 = turn and run when breaking, 0 = keep facing the enemy
     'moveStrafe',  // strafe oscillation kept on top of a repositioning walk
-    'netW'         // weight on the trained P(die within T) head; 0 = heuristic U
+    'netW',        // weight on the trained P(die within T) head; 0 = heuristic U
+    'blur'         // 0..1: how far enemies are assumed to have moved by the
+                   // time an imagined state arrives. 0 = frozen enemies.
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
@@ -185,7 +187,7 @@ function POLICY_BODY() {
     [16, 512], [2, 8], [0.5, 4], [1, 10], [0.3, 2.5],
     [0.2, 3], [0.2, 4], [1, 20], [0, 2], [0, 1.5], [0, 1.5],
     [0.2, 6], [3, 20], [0.2, 3], [0, 90], [0.1, 1],
-    [0.3, 2.5], [0.3, 2.5], [0, 4], [0, 1], [0, 1], [0, 20]
+    [0.3, 2.5], [0.3, 2.5], [0, 4], [0, 1], [0, 1], [0, 20], [0, 1.5]
   ];
   const P = {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
@@ -195,7 +197,7 @@ function POLICY_BODY() {
     killW: 1.0, dmgW: 1.0, deathW: 6.0, riskW: 0.5, oppW: 0.25, hpW: 0.4,
     priorBeta: 1.6, planHz: 7, commitS: 0.7, fleeHp: 45, coverMul: 0.35,
     botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7,
-    netW: 6.0
+    netW: 6.0, blur: 1.0
   };
 
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -349,6 +351,89 @@ function POLICY_BODY() {
     return VIS[a * RG.R + b];
   }
 
+  /* ---- the enemies are not frozen ------------------------------------
+     The model's remaining error was that it pinned every bot where it stood
+     at replan time, while bots run at 5.3 m/s. By the second macro-step
+     that is 15 m of nonsense.
+
+     The fix keeps the whole thing arithmetic. Dilate visibility by each
+     bot's REACHABILITY over the elapsed time: "can that bot see this
+     region" becomes "could anywhere that bot could have got to see this
+     region". Reach sets come from a Dijkstra over the region graph at a few
+     fixed radii, computed once; the dilated matrix VISD[k] is then an OR of
+     VIS rows and is built lazily by row like VIS itself.
+
+     Staleness is part of the abstract state -- the key carries a two-bit
+     TIME BUCKET, so a region reached in one macro-step and the same region
+     reached in three are different nodes with different amounts of assumed
+     enemy movement. That is what makes the depth test honest: a deeper plan
+     is now automatically a blurrier one, and the search has to earn its
+     depth against its own growing uncertainty rather than being handed a
+     falsely crisp future. */
+  const TB = 4;                 // time buckets: now, one step, two, three+
+  const BOT_SPEED = 5.3;
+  /* One bucket is one macro-step of staleness, so shortening the atom
+     shortens the assumed drift with it rather than leaving the blur sized
+     for an action length that is no longer being taken. */
+  const tbSecs = () => Math.max(0.4, P.dwell);
+  let REACH_S = null, REACH_T = null;      // flattened reach lists per bucket
+  let VISD = null, VISDROW = null, VISD_BLUR = -1;
+
+  function buildReach() {
+    const R = RG.R;
+    REACH_S = []; REACH_T = [];
+    for (let k = 0; k < TB; k++) {
+      const radius = BOT_SPEED * tbSecs() * k * P.blur;
+      const start = new Int32Array(R + 1), list = [];
+      const dist = new Float64Array(R), heap = [];
+      for (let r = 0; r < R; r++) {
+        start[r] = list.length;
+        if (radius <= 0) { list.push(r); continue; }
+        dist.fill(Infinity); dist[r] = 0;
+        heap.length = 0; heap.push(r);
+        /* radii are small and degree is ~4, so a plain relaxation sweep is
+           cheaper than a heap and this runs once per match */
+        for (let pass = 0; pass < heap.length; pass++) {
+          const u = heap[pass];
+          const s0 = RG.adjStart[u], e0 = RG.adjStart[u + 1];
+          for (let e = s0; e < e0; e++) {
+            const v = RG.adjTo[e], nd = dist[u] + RG.adjCost[e];
+            if (nd < dist[v] && nd <= radius) { dist[v] = nd; heap.push(v); }
+          }
+        }
+        for (let v = 0; v < R; v++) if (dist[v] <= radius) list.push(v);
+      }
+      start[R] = list.length;
+      REACH_S.push(start); REACH_T.push(Int32Array.from(list));
+    }
+    VISD = []; VISDROW = [];
+    for (let k = 0; k < TB; k++) {
+      VISD.push(new Uint8Array(R * R));
+      VISDROW.push(new Uint8Array(R));
+    }
+    VISD_BLUR = P.blur * 1000 + tbSecs();
+  }
+
+  /* can a bot last seen in region e see region a, given k buckets of drift */
+  function visD(a, e, k) {
+    if (VISD_BLUR !== P.blur * 1000 + tbSecs()) buildReach();
+    if (k <= 0) return visOf(a, e);
+    const R = RG.R;
+    if (!VISDROW[k][a]) {
+      visOf(a, 0);                                  // force VIS row a
+      const st = REACH_S[k], to = REACH_T[k], row = a * R, out = VISD[k];
+      for (let c = 0; c < R; c++) {
+        let v = 0;
+        for (let i = st[c], j = st[c + 1]; i < j; i++) {
+          if (VIS[row + to[i]]) { v = 1; break; }
+        }
+        out[row + c] = v;
+      }
+      VISDROW[k][a] = 1;
+    }
+    return VISD[k][a * R + e];
+  }
+
   function ensureNav(G) {
     const nav = G.nav || (typeof AI !== 'undefined' && typeof MAP !== 'undefined'
       ? AI.buildNav(MAP) : null);
@@ -358,6 +443,7 @@ function POLICY_BODY() {
       RG = buildRegions(nav);
       VIS = new Uint8Array(RG.R * RG.R);
       VISROW = new Uint8Array(RG.R);
+      buildReach();
     }
     return nav;
   }
@@ -418,11 +504,11 @@ function POLICY_BODY() {
     S.hpNow = Math.max(0, me.health || 0);
     /* lazily-filled per-region line-of-sight tables */
     S.stamp++;
-    if (!S.seen || S.seen.length !== RG.R) {
-      S.seen = new Int32Array(RG.R);
-      S.losMask = new Int32Array(RG.R);
-      S.dpsTab = new Float32Array(RG.R * MAXE);
-      S.dstTab = new Float32Array(RG.R * MAXE);
+    if (!S.seen || S.seen.length !== RG.R * TB) {
+      S.seen = new Int32Array(RG.R * TB);
+      S.losMask = new Int32Array(RG.R * TB);
+      S.dpsTab = new Float32Array(RG.R * TB * MAXE);
+      S.dstTab = new Float32Array(RG.R * TB * MAXE);
     }
   }
   S.errK = []; S.ereg = [];
@@ -431,32 +517,35 @@ function POLICY_BODY() {
   /* Does enemy i hold a sightline onto region r, and if so how hard does it
      hurt? A matrix lookup plus a distance, memoised per region for the life
      of the replan. */
-  function losOf(r) {
-    if (S.seen[r] === S.stamp) return S.losMask[r];
-    S.seen[r] = S.stamp;
+  function losOf(r, tb) {
+    const slot = tb * RG.R + r;
+    if (S.seen[slot] === S.stamp) return S.losMask[slot];
+    S.seen[slot] = S.stamp;
     let mask = 0;
     const ex = RG.rx[r], ez = RG.rz[r];
-    const base = r * MAXE;
+    const base = slot * MAXE;
+    /* they could have closed this much ground since we last looked */
+    const creep = BOT_SPEED * tbSecs() * tb * P.blur;
     for (let i = 0; i < S.n; i++) {
-      const d = Math.hypot(S.ax[i] - ex, S.az[i] - ez);
+      const d = Math.max(2, Math.hypot(S.ax[i] - ex, S.az[i] - ez) - creep);
       S.dstTab[base + i] = d;
       let dps = 0;
-      if (d < 60 && visOf(r, S.ereg[i])) {
+      if (d < 60 && visD(r, S.ereg[i], tb)) {
         mask |= (1 << i);
         /* aim error opens a cone that grows with range; a 0.45m target in it */
         dps = S.dps[i] * clamp(0.45 / (0.45 + S.errK[i] * d), 0.05, 0.9);
       }
       S.dpsTab[base + i] = dps;
     }
-    S.losMask[r] = mask;
+    S.losMask[slot] = mask;
     return mask;
   }
 
   /* incoming damage per second at region r against the living set `mask` */
-  function threatAt(r, mask) {
-    const los = losOf(r) & mask;
+  function threatAt(r, mask, tb) {
+    const los = losOf(r, tb) & mask;
     if (!los) return 0;
-    const base = r * MAXE;
+    const base = (tb * RG.R + r) * MAXE;
     let s = 0;
     for (let i = 0; i < S.n; i++) if (los & (1 << i)) s += S.dpsTab[base + i];
     return s;
@@ -464,10 +553,10 @@ function POLICY_BODY() {
   /* damage over an exposure window; `fresh` means the sightline is new, so
      the bots have to re-acquire first -- reaction time is the single
      biggest reason a short exposure is nearly free and a long one kills */
-  function damageOver(r, mask, T, fresh) {
-    const los = losOf(r) & mask;
+  function damageOver(r, mask, T, fresh, tb) {
+    const los = losOf(r, tb) & mask;
     if (!los || T <= 0) return 0;
-    const base = r * MAXE;
+    const base = (tb * RG.R + r) * MAXE;
     let s = 0;
     for (let i = 0; i < S.n; i++) {
       if (!(los & (1 << i))) continue;
@@ -478,11 +567,11 @@ function POLICY_BODY() {
   }
   /* the enemy we would shoot from region r, and how fast */
   const OUR = { idx: -1, dps: 0 };
-  function ourShot(r, mask) {
-    const los = losOf(r) & mask;
+  function ourShot(r, mask, tb) {
+    const los = losOf(r, tb) & mask;
     OUR.idx = -1; OUR.dps = 0;
     if (!los) return false;
-    const base = r * MAXE;
+    const base = (tb * RG.R + r) * MAXE;
     let bd = Infinity, bi = -1;
     for (let i = 0; i < S.n; i++) {
       if (!(los & (1 << i))) continue;
@@ -502,9 +591,9 @@ function POLICY_BODY() {
   const HPB = 6, AMMOB = 3;
   const table = new Map();
 
-  function keyOf(r, mask, hp, ammo) {
+  function keyOf(r, mask, hp, ammo, tb) {
     const h = clamp((hp / 100 * HPB) | 0, 0, HPB - 1);
-    return ((r * 256 + mask) * HPB + h) * AMMOB + ammo;
+    return (((r * 256 + mask) * HPB + h) * AMMOB + ammo) * TB + tb;
   }
 
   /* =================================================================
@@ -533,9 +622,9 @@ function POLICY_BODY() {
   /* Every feature is a function of the ABSTRACT state plus the frozen
      situation, so the vector logged for the label at the root and the
      vector evaluated at an imagined leaf are produced by the same code. */
-  function featuresOf(r, mask, hp, ammo) {
-    const los = losOf(r) & mask;
-    const base = r * MAXE;
+  function featuresOf(r, mask, hp, ammo, tb) {
+    const los = losOf(r, tb) & mask;
+    const base = (tb * RG.R + r) * MAXE;
     let inc = 0, seers = 0, worst = 0, nearSeen = 99, nearAny = 99, alive = 0;
     for (let i = 0; i < S.n; i++) {
       if (!(mask & (1 << i))) continue;
@@ -554,7 +643,7 @@ function POLICY_BODY() {
     let safeN = 0, degN = 0, bestEsc = 1e9;
     const s0 = RG.adjStart[r], e0 = RG.adjStart[r + 1];
     for (let k = s0; k < e0; k++) {
-      const t = threatAt(RG.adjTo[k], mask);
+      const t = threatAt(RG.adjTo[k], mask, tb);
       degN++;
       if (t <= 0) safeN++;
       if (t < bestEsc) bestEsc = t;
@@ -569,7 +658,7 @@ function POLICY_BODY() {
     FEAT[5] = alive / 8;
     FEAT[6] = RG.rcover[r];
     FEAT[7] = ammo / (AMMOB - 1);
-    FEAT[8] = ourShot(r, mask) ? OUR.dps / 180 : 0;
+    FEAT[8] = ourShot(r, mask, tb) ? OUR.dps / 180 : 0;
     FEAT[9] = degN ? safeN / degN : 0;
     FEAT[10] = bestEsc / 100;
     FEAT[11] = RG.rlevel[r];
@@ -595,27 +684,27 @@ function POLICY_BODY() {
   /* U(n): the leaf value. With a head, it is minus the weighted probability
      of dying in the next few seconds. Without one, the old hand-written
      guess, kept so the arm still runs before anything is trained. */
-  function evalState(r, mask, hp, ammo) {
+  function evalState(r, mask, hp, ammo, tb) {
     if (hp <= 0) return -P.deathW;
     if (NET && P.netW > 0) {
-      featuresOf(r, mask, hp, ammo);
+      featuresOf(r, mask, hp, ammo, tb);
       return -P.netW * netP();
     }
-    const t = threatAt(r, mask);
-    const opp = (losOf(r) & mask) ? 1 : 0;
+    const t = threatAt(r, mask, tb);
+    const opp = (losOf(r, tb) & mask) ? 1 : 0;
     return -P.riskW * (t / 100) * (2 - hp / 100)
       + P.hpW * (hp / 100)
       + P.oppW * opp
       - (ammo === 0 ? 0.2 : 0);
   }
 
-  function getNode(key, r, mask, hp, ammo) {
+  function getNode(key, r, mask, hp, ammo, tb) {
     let n = table.get(key);
     if (n) { STATS.hits++; return n; }
     STATS.miss++;
     n = {
-      key, r, mask, hp, ammo,
-      U: evalState(r, mask, hp, ammo),
+      key, r, mask, hp, ammo, tb,
+      U: evalState(r, mask, hp, ammo, tb),
       Q: 0, N: 0, acts: null, edgeN: 0
     };
     n.Q = n.U;
@@ -641,19 +730,24 @@ function POLICY_BODY() {
     /* damage taken: half the transit under the old sightlines, half under
        the new, then the dwell. Moving buys the enemies' reaction time back;
        standing still does not. */
+    /* the state we act FROM is as stale as this node is; the state we
+       arrive in is staler still by the length of the action */
+    const tb = node.tb;
+    const tb2 = Math.min(TB - 1, tb + Math.max(1, Math.round(T / tbSecs())));
+
     let dmg = 0;
     if (move) {
-      dmg += damageOver(r, node.mask, tMove * 0.5, false);
-      dmg += damageOver(toR, node.mask, tMove * 0.5, true);
-      dmg += damageOver(toR, node.mask, tDwell, true) * (cover ? P.coverMul : 1);
+      dmg += damageOver(r, node.mask, tMove * 0.5, false, tb);
+      dmg += damageOver(toR, node.mask, tMove * 0.5, true, tb2);
+      dmg += damageOver(toR, node.mask, tDwell, true, tb2) * (cover ? P.coverMul : 1);
     } else {
-      dmg += damageOver(r, node.mask, T, false) * (cover ? P.coverMul : 1);
+      dmg += damageOver(r, node.mask, T, false, tb) * (cover ? P.coverMul : 1);
     }
 
     /* damage dealt */
     let kills = 0, progress = 0, mask = node.mask;
     let ammo = node.ammo;
-    if (!cover && ourShot(toR, node.mask)) {
+    if (!cover && ourShot(toR, node.mask, tb2)) {   // the dwell is at the END of the action
       const need = S.hp[OUR.idx];
       const dealt = OUR.dps * Math.max(0, tDwell - 0.15);
       progress = clamp(dealt / need, 0, 1);
@@ -661,7 +755,7 @@ function POLICY_BODY() {
       /* rounds are not the binding constraint here, but the abstraction
          carries ammo, so spend it and pay for the reload when it runs out */
       ammo = ammo - (dealt > 0 ? 1 : 0);
-      if (ammo < 0) { ammo = AMMOB - 1; dmg += damageOver(toR, mask, 1.55, false); }
+      if (ammo < 0) { ammo = AMMOB - 1; dmg += damageOver(toR, mask, 1.55, false, tb2); }
     }
 
     const hp = node.hp - dmg;
@@ -671,10 +765,10 @@ function POLICY_BODY() {
       - (dead ? P.deathW : 0);
 
     return {
-      toR, cover, T, dead,
+      toR, cover, T, dead, sTb: tb2,
       r: reward,
       disc: Math.exp(-T / P.tau),
-      sKey: dead ? -1 : keyOf(toR, mask, hp, ammo),
+      sKey: dead ? -1 : keyOf(toR, mask, hp, ammo, tb2),
       sMask: mask, sHp: hp, sAmmo: ammo,
       P: 0, n: 0, A: 0, child: null
     };
@@ -741,7 +835,7 @@ function POLICY_BODY() {
       return node.Q;
     }
     let child = a.child;
-    if (!child) child = a.child = getNode(a.sKey, a.toR, a.sMask, a.sHp, a.sAmmo);
+    if (!child) child = a.child = getNode(a.sKey, a.toR, a.sMask, a.sHp, a.sAmmo, a.sTb);
     /* CYCLE. The successor is already on this descent path -- most often it
        IS this node, because "stand where you are and fight" maps the abstract
        state to itself. Banning the edge was the first thing tried and it is
@@ -791,8 +885,9 @@ function POLICY_BODY() {
     const ammo0 = clamp(((me.ammo / mag) * AMMOB) | 0, 0, AMMOB - 1);
 
     table.clear();
-    const root = getNode(keyOf(r0, S.aliveMask, S.hpNow, ammo0),
-      r0, S.aliveMask, S.hpNow, ammo0);
+    /* the root is not stale: we just measured it */
+    const root = getNode(keyOf(r0, S.aliveMask, S.hpNow, ammo0, 0),
+      r0, S.aliveMask, S.hpNow, ammo0, 0);
 
     const sims = P.sims | 0;
     for (let i = 0; i < sims; i++) {
@@ -802,7 +897,7 @@ function POLICY_BODY() {
     }
     STATS.plans++; STATS.sims += sims; STATS.nodes += table.size; STATS.rays = VISRAYS;
     if (LOG.on) {
-      featuresOf(r0, S.aliveMask, S.hpNow, ammo0);
+      featuresOf(r0, S.aliveMask, S.hpNow, ammo0, 0);
       LOG.t.push(t);
       LOG.f.push(Array.prototype.slice.call(FEAT));
     }

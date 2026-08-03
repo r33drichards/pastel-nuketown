@@ -11,14 +11,48 @@
      1. historical markings (innovation numbers) for topological crossover
      2. speciation with explicit fitness sharing, using
         delta = c1*E/N + c2*D/N + c3*Wbar
-     3. complexification from a minimal topology — the initial population
-        has no hidden nodes and no connections at all
+     3. complexification from the paper's minimal topology — no hidden
+        nodes, inputs wired straight to outputs
 
    This file owns the ENCODING, which is the part that matters: what the
    network sees and what it is allowed to do. The trainer imports
    `buildSource` from here so there is exactly one implementation of the
    sensors and the forward pass — the thing that evolved and the thing
    that ships are the same code.
+
+   ---- RESULT: THIS LOSES, AND BY A LOT ---------------------------------
+
+   Read this before reading anything else into the numbers.
+
+     10 paired matches, seeds 1-10, full uncapped eval-policy.js matches
+
+       shipped   fitness 15.833   25.00 kills   1.00 deaths   10/10 won
+       neat      fitness  0.013    0.20 kills  11.30 deaths    0/10 won
+
+       0 better / 10 worse / 0 tied, sign test p = 0.002
+
+   The embedded genome is the best of a 17-generation run at population
+   32 on three training seeds — 1623 matches, about 35 minutes of one
+   core. It never learned to shoot. Across all seventeen generations the
+   champion's mean kills in a fifteen-second match stayed at exactly 0;
+   the only thing that moved was the crosshair-proximity score, 0.094 to
+   0.188, and that plateaued after generation twelve. In a full match it
+   lands about 1% of its shots against the shipped policy's 78%, so the
+   bots reach 25 kills first, every time.
+
+   This file is kept as a negative result, not as a candidate. The
+   encoding, the harness wiring and the trainer are sound and reusable;
+   the compute was two orders of magnitude short of what the method
+   needs. For scale, the paper's own double-pole-balancing runs average
+   3600 network evaluations at population 150, on a problem with a dense
+   fitness and a one-number action space. This problem has eight
+   outputs, a fitness that is flat at zero until the network can already
+   aim, and it got 32 genomes for 17 generations.
+
+   The second-ranked finalist scored 0.030 on the same ten seeds — also
+   zero to two significant figures. The one embedded here is the one the
+   TRAINING seeds picked; swapping to the other because it did better on
+   the validation seeds would be choosing on the test set.
    ===================================================================== */
 
 /* ---- the encoding ---------------------------------------------------
