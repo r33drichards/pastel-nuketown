@@ -147,6 +147,10 @@ npm run check      # syntax-check every source file + tests + build freshness
 
 The test suite covers bot navigation, weapon validation, wire protocol parsing, room lifecycle, origin allowlisting, hostile-input rejection, and — through a headless harness that runs the real client — guest-side prediction, the host/guest fairness baseline, and the matchmaking decisions PLAY makes on the player's behalf.
 
+### Spectator freecam
+
+`dev/freecam.js` is a console tool, not part of the build. Paste it into the browser console during a match and the camera leaves your body: WASD flies where you are looking, space and ctrl go up and down, shift is fast, the wheel sets cruise speed, and V toggles. `freecam.top()` jumps to the overhead view of the whole arena. While it is on your body stands still, takes no damage, stops no bullets and is invisible to the bots, so what you are watching is the match that would have happened without you standing in it. Turning it off puts everything back.
+
 ### The pre-commit hook
 
 `index.html` is tracked, so every commit touching `src/` has to carry a rebuilt copy or `npm run check` fails on build freshness. Forgetting surfaces later as a red branch rather than at the moment it was caused, so `.githooks/pre-commit` rebuilds and stages the artefact alongside the change that caused it.
