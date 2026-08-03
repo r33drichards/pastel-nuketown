@@ -584,6 +584,6 @@ const POLICY = (() => {
 
 module.exports = {
   name: 'threatfld',
-  describe: 'nav-graph potential field: threat, cover, opportunity, pressure, travel',
+  describe: 'nav-graph potential field (threat/cover/opportunity/pressure/travel), gated on exposure',
   policySource: () => SOURCE
 };

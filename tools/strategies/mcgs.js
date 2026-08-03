@@ -142,7 +142,8 @@ function POLICY_BODY() {
     'ourDpsK',     // scales the modelled player damage output
     'stayBias',    // reward added to "stand and fight"; large = never replan
     'breakLook',   // 1 = turn and run when breaking, 0 = keep facing the enemy
-    'moveStrafe'   // strafe oscillation kept on top of a repositioning walk
+    'moveStrafe',  // strafe oscillation kept on top of a repositioning walk
+    'netW'         // weight on the trained P(die within T) head; 0 = heuristic U
   ];
   const PARAM_BOUNDS = [
     [3, 40], [0.5, 8], [0.005, 0.30], [3, 30], [0.3, 3.0],
@@ -150,7 +151,7 @@ function POLICY_BODY() {
     [16, 512], [2, 8], [0.5, 4], [1, 10], [0.3, 2.5],
     [0.2, 3], [0.2, 4], [1, 20], [0, 2], [0, 1.5], [0, 1.5],
     [0.2, 6], [3, 20], [0.2, 3], [0, 90], [0.1, 1],
-    [0.3, 2.5], [0.3, 2.5], [0, 4], [0, 1], [0, 1]
+    [0.3, 2.5], [0.3, 2.5], [0, 4], [0, 1], [0, 1], [0, 20]
   ];
   const P = {
     engageRange: 14, rangeBand: 3, fireCone: 0.05, turnRate: 12,
@@ -159,7 +160,8 @@ function POLICY_BODY() {
     sims: 128, maxDepth: 5, cPuct: 1.4, tau: 3.5, dwell: 1.4,
     killW: 1.0, dmgW: 1.0, deathW: 6.0, riskW: 0.5, oppW: 0.25, hpW: 0.4,
     priorBeta: 1.6, planHz: 7, commitS: 0.7, fleeHp: 45, coverMul: 0.35,
-    botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7
+    botDpsK: 1.0, ourDpsK: 1.0, stayBias: 0.5, breakLook: 0, moveStrafe: 0.7,
+    netW: 6.0
   };
 
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -471,10 +473,100 @@ function POLICY_BODY() {
     return ((r * 256 + mask) * HPB + h) * AMMOB + ammo;
   }
 
-  /* U(n): the leaf value. No network -- this is the substitute, and it is
-     the weakest part of the whole thing. */
+  /* =================================================================
+     THE VALUE HEAD
+
+     U(n) used to be a hand-written linear guess, and the ablations said
+     that guess -- not the search -- was the binding constraint. So it is
+     trained instead.
+
+     WHAT IT PREDICTS: P(the local player dies within LOOKAHEAD seconds of
+     being in this abstract state). Not "how good is this position" in the
+     abstract: fitness is 25/(deaths+1) because kills are capped at 25 and
+     always taken, so survival IS the objective, and phrasing it that way
+     turns U(n) into a supervised problem whose labels are free -- every
+     match already knows who died and when.
+
+     A 13-feature vector, one 32-unit tanh layer, a sigmoid. 481 weights,
+     a few hundred nanoseconds a call, and it serialises to a plain array
+     that drops into a Tampermonkey userscript with nothing to load.
+     ================================================================= */
+  const NF = 13;
+  const FEAT = new Float64Array(NF);
+  const NET = (typeof MCGS_NET !== 'undefined' && MCGS_NET && MCGS_NET.w1) ? MCGS_NET : null;
+  const HID = NET ? new Float64Array(NET.h) : null;
+
+  /* Every feature is a function of the ABSTRACT state plus the frozen
+     situation, so the vector logged for the label at the root and the
+     vector evaluated at an imagined leaf are produced by the same code. */
+  function featuresOf(r, mask, hp, ammo) {
+    const los = losOf(r) & mask;
+    const base = r * MAXE;
+    let inc = 0, seers = 0, worst = 0, nearSeen = 99, nearAny = 99, alive = 0;
+    for (let i = 0; i < S.n; i++) {
+      if (!(mask & (1 << i))) continue;
+      alive++;
+      const d = S.dstTab[base + i];
+      if (d < nearAny) nearAny = d;
+      if (los & (1 << i)) {
+        seers++;
+        inc += S.dpsTab[base + i];
+        if (S.dpsTab[base + i] > worst) worst = S.dpsTab[base + i];
+        if (d < nearSeen) nearSeen = d;
+      }
+    }
+    /* Can I leave? The neighbours are already in the visibility matrix, so
+       "is there a safe step from here" costs four table lookups. */
+    let safeN = 0, degN = 0, bestEsc = 1e9;
+    const s0 = RG.adjStart[r], e0 = RG.adjStart[r + 1];
+    for (let k = s0; k < e0; k++) {
+      const t = threatAt(RG.adjTo[k], mask);
+      degN++;
+      if (t <= 0) safeN++;
+      if (t < bestEsc) bestEsc = t;
+    }
+    if (!degN) bestEsc = inc;
+
+    FEAT[0] = hp / 100;
+    FEAT[1] = inc / 100;
+    FEAT[2] = seers / 4;
+    FEAT[3] = 1 / (1 + nearSeen / 10);
+    FEAT[4] = 1 / (1 + nearAny / 10);
+    FEAT[5] = alive / 8;
+    FEAT[6] = RG.rcover[r];
+    FEAT[7] = ammo / (AMMOB - 1);
+    FEAT[8] = ourShot(r, mask) ? OUR.dps / 180 : 0;
+    FEAT[9] = degN ? safeN / degN : 0;
+    FEAT[10] = bestEsc / 100;
+    FEAT[11] = RG.rlevel[r];
+    FEAT[12] = worst / 60;
+    return FEAT;
+  }
+
+  function netP() {
+    const mu = NET.mu, sd = NET.sd, w1 = NET.w1, b1 = NET.b1, w2 = NET.w2;
+    const h = NET.h;
+    let out = NET.b2;
+    for (let j = 0; j < h; j++) {
+      let a = b1[j];
+      const row = j * NF;
+      for (let i = 0; i < NF; i++) a += w1[row + i] * ((FEAT[i] - mu[i]) / sd[i]);
+      const t = Math.tanh(a);
+      HID[j] = t;
+      out += w2[j] * t;
+    }
+    return 1 / (1 + Math.exp(-out));
+  }
+
+  /* U(n): the leaf value. With a head, it is minus the weighted probability
+     of dying in the next few seconds. Without one, the old hand-written
+     guess, kept so the arm still runs before anything is trained. */
   function evalState(r, mask, hp, ammo) {
     if (hp <= 0) return -P.deathW;
+    if (NET && P.netW > 0) {
+      featuresOf(r, mask, hp, ammo);
+      return -P.netW * netP();
+    }
     const t = threatAt(r, mask);
     const opp = (losOf(r) & mask) ? 1 : 0;
     return -P.riskW * (t / 100) * (2 - hp / 100)
@@ -643,6 +735,10 @@ function POLICY_BODY() {
      THE PLANNER
      ================================================================= */
   const GOAL = { node: -1, region: -1, stance: 'engage', at: -1 };
+  /* Label collection. Off by default and costing nothing when off: one
+     feature vector per replan, plus the wall-clock of every death. The
+     labeller outside joins them -- y = 1 if a death falls in (t, t+T]. */
+  const LOG = { on: false, t: [], f: [], deaths: [], tEnd: 0 };
   const PATHSET = new Set();
   let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0, hits: 0, miss: 0 };
 
@@ -671,6 +767,11 @@ function POLICY_BODY() {
       simulate(root, 0, PATHSET);
     }
     STATS.plans++; STATS.sims += sims; STATS.nodes += table.size; STATS.rays = VISRAYS;
+    if (LOG.on) {
+      featuresOf(r0, S.aliveMask, S.hpNow, ammo0);
+      LOG.t.push(t);
+      LOG.f.push(Array.prototype.slice.call(FEAT));
+    }
 
     /* the move is the most-visited EDGE out of the root */
     let best = null;
@@ -691,7 +792,7 @@ function POLICY_BODY() {
   /* =================================================================
      THE CONTROLLER -- the shipped reactive policy, movement excepted
      ================================================================= */
-  let t = 0, strafeSign = 1, phase = 0, planT = 0, commitT = 0;
+  let t = 0, strafeSign = 1, phase = 0, planT = 0, commitT = 0, wasAlive = true;
   let path = null, pathI = 0, pathGoal = -1, pathT = 0;
 
   function pickTarget(me, G) {
@@ -756,6 +857,11 @@ function POLICY_BODY() {
       STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0, rays: 0, hits: 0, miss: 0 };
     },
     stats: () => STATS,
+    /* label collection, driven from the training loop */
+    __log(on) { LOG.on = !!on; return LOG.on; },
+    __dump() { return { t: LOG.t, f: LOG.f, deaths: LOG.deaths, tEnd: LOG.tEnd }; },
+    __hasNet: () => !!NET,
+    __nf: NF,
     /* for the offline timer: run the search n times, nothing else */
     __bench(n, G) {
       const g = G || (typeof globalThis !== 'undefined' && globalThis.G);
@@ -766,9 +872,13 @@ function POLICY_BODY() {
     act(me, G, dt) {
       t += dt;
       if (!me.alive) {
+        if (LOG.on && wasAlive) LOG.deaths.push(t);
+        wasAlive = false;
         GOAL.node = -1; path = null; pathGoal = -1; commitT = 0; planT = 0;
         return null;
       }
+      wasAlive = true;
+      if (LOG.on) LOG.tEnd = t;
 
       const { target, dist, visible } = pickTarget(me, G);
       if (!target) return { yaw: me.yaw + P.searchTurn * dt };
@@ -850,8 +960,25 @@ function POLICY_BODY() {
   };
 }
 
+/* The trained value head, as a plain array of numbers. It is spliced in
+   ahead of the policy so the vm sees `MCGS_NET` as an ordinary global --
+   the same thing that happens when this ships inside the userscript, where
+   there is no fetch and no loader and a strict CSP. MCGS_NET_FILE lets the
+   training loop point an arm at a candidate net without disturbing this
+   one. */
+const fs = require('node:fs');
+const pathmod = require('node:path');
+const NET_FILE = process.env.MCGS_NET_FILE ||
+  pathmod.join(__dirname, 'mcgs.net.json');
+
+function netLiteral() {
+  try { return 'var MCGS_NET = ' + fs.readFileSync(NET_FILE, 'utf8') + ';\n'; }
+  catch (e) { return 'var MCGS_NET = null;\n'; }
+}
+
 module.exports = {
   name: 'mcgs',
-  describe: 'Monte-Carlo graph search over (region, enemy set, hp, ammo); goals feed the tuned reactive controller',
-  policySource: () => 'const POLICY = (' + POLICY_BODY.toString() + ')();'
+  describe: 'Monte-Carlo graph search over (region, enemy set, hp, ammo) with a trained P(death within 3s) value head',
+  netFile: NET_FILE,
+  policySource: () => netLiteral() + 'const POLICY = (' + POLICY_BODY.toString() + ')();'
 };
