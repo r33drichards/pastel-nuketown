@@ -750,6 +750,29 @@ const POLICY = (() => {
      increment, which is what seeds each shot's spread. */
   const FIRE = new Map([[true, () => pressFire()], [false, () => releaseFire()]]);
 
+  /* A reload has to travel, and calling tryReload alone does not send it.
+     Pressing R does two things — IN.reloadSeq++ and tryReload — and the
+     sequence is the half that crosses the wire: the host starts a guest's
+     reload only on a reloadSeq edge. Bypassing it is invisible in a solo
+     match and pure damage online, because the host never starts the reload,
+     its next snapshot overwrites the locally predicted reloadT with the
+     authoritative 0, and the policy immediately asks again. That is a reload
+     restarting every snapshot and never finishing, with the rounds still in
+     the magazine going out between the attempts.
+
+     Wrapped here rather than changed in the policy: the policy asks for a
+     reload, and how that reaches the simulation is the driver's business. */
+  const engineTryReload = tryReload;
+  window.tryReload = function (a) {
+    const before = a ? a.reloadT : 0;
+    const out = engineTryReload.apply(this, arguments);
+    /* Only when a reload actually began, and only for the local player. A
+       bump for a call that started nothing would ask the host for a reload
+       this client is not running, and the bots reload through here too. */
+    if (a === G.player && before <= 0 && a.reloadT > 0) IN.reloadSeq++;
+    return out;
+  };
+
   let on = true, warned = false;
   const orig = window.simulate;
   if (typeof orig !== 'function') { console.error('[auto] window.simulate not found'); return; }
