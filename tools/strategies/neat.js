@@ -91,13 +91,16 @@ const SENSE_EVERY = 4;     // ticks between forward passes (60 Hz / 4 = 15 Hz)
    ------------------------------------------------------------------ */
 const GENOME = require('./neat.genome.json');
 
-function buildSource(genome) {
+function buildSource(genome, opts) {
   const g = genome || GENOME;
+  const o = opts || {};
+  const turn = o.turnRate == null ? TURN_RATE : o.turnRate;
+  const decim = o.senseEvery == null ? SENSE_EVERY : o.senseEvery;
   return `
 const POLICY = (() => {
   const NI = ${N_IN}, NO = ${N_OUT};
-  const TURN = ${TURN_RATE};
-  const DECIM = ${SENSE_EVERY};
+  const TURN = ${turn};
+  const DECIM = ${decim};
   const HIDDEN = ${JSON.stringify(g.hidden || [])};
   const CONNS = ${JSON.stringify(g.conns || [])};
 

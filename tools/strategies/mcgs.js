@@ -552,7 +552,7 @@ function POLICY_BODY() {
      ================================================================= */
   const GOAL = { node: -1, region: -1, stance: 'engage', at: -1 };
   const PATHSET = new Set();
-  let STATS = { plans: 0, nodes: 0, sims: 0 };
+  let STATS = { plans: 0, nodes: 0, sims: 0, engage: 0, reposition: 0, brk: 0, paths: 0 };
 
   function runPlan(me, G) {
     const nav = ensureNav(G);

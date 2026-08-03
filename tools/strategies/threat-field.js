@@ -106,10 +106,78 @@ const POLICY = (() => {
   let nav = null, dist = null, parent = null, stamp = null, closed = null, epoch = 0;
   let heapId = null, heapF = null, heapN = 0;
 
+  /* Line of sight, allocation-free.
+
+     The engine's canSee() is correct and is what the aim/fire path uses, but
+     it goes through raycastMap -> rayBox, which builds two three-element
+     arrays per box. The field asks for a few hundred of these every recompute
+     and 110 solids each, so that is ~100k short-lived arrays a recompute and
+     the garbage collector eats the tick. The same slab test over flat typed
+     arrays is the single biggest cost saving in this file: ~5x.
+
+     Only the static solids are tested, exactly like canSee. The ground plane
+     canSee also checks cannot block an eye-to-eye segment, since both ends are
+     above y = 0. */
+  let SX0 = null, SY0 = null, SZ0 = null, SX1 = null, SY1 = null, SZ1 = null, NSOL = 0;
+  function initSolids() {
+    const src = (typeof SOLIDS !== 'undefined' && SOLIDS) ||
+                (typeof MAP !== 'undefined' && MAP.solids) || null;
+    if (!src || !src.length) return false;
+    NSOL = src.length;
+    SX0 = new Float64Array(NSOL); SY0 = new Float64Array(NSOL); SZ0 = new Float64Array(NSOL);
+    SX1 = new Float64Array(NSOL); SY1 = new Float64Array(NSOL); SZ1 = new Float64Array(NSOL);
+    for (let i = 0; i < NSOL; i++) {
+      const s = src[i];
+      SX0[i] = s.min[0]; SY0[i] = s.min[1]; SZ0[i] = s.min[2];
+      SX1[i] = s.max[0]; SY1[i] = s.max[1]; SZ1[i] = s.max[2];
+    }
+    return true;
+  }
+  function losClear(ax, ay, az, bx, by, bz) {
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-4) return true;
+    /* canSee stops 5 cm short of the target, so a wall the target is flush
+       against does not count as blocking. Matched here in segment units. */
+    const tEnd = (len - 0.05) / len;
+    if (tEnd <= 0) return true;
+    const ix = dx !== 0 ? 1 / dx : 0, iy = dy !== 0 ? 1 / dy : 0, iz = dz !== 0 ? 1 / dz : 0;
+    for (let k = 0; k < NSOL; k++) {
+      let t0 = 0, t1 = tEnd, a, b, tmp;
+      if (dx === 0) { if (ax < SX0[k] || ax > SX1[k]) continue; }
+      else {
+        a = (SX0[k] - ax) * ix; b = (SX1[k] - ax) * ix;
+        if (a > b) { tmp = a; a = b; b = tmp; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) continue;
+      }
+      if (dy === 0) { if (ay < SY0[k] || ay > SY1[k]) continue; }
+      else {
+        a = (SY0[k] - ay) * iy; b = (SY1[k] - ay) * iy;
+        if (a > b) { tmp = a; a = b; b = tmp; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) continue;
+      }
+      if (dz === 0) { if (az < SZ0[k] || az > SZ1[k]) continue; }
+      else {
+        a = (SZ0[k] - az) * iz; b = (SZ1[k] - az) * iz;
+        if (a > b) { tmp = a; a = b; b = tmp; }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
   function initNav(G) {
     const n = (G && G.nav) || (typeof AI !== 'undefined' && typeof MAP !== 'undefined'
       ? AI.buildNav(MAP) : null);
     if (!n || !n.nodes || !n.nodes.length) return false;
+    if (!initSolids()) return false;
     nav = n;
     const c = nav.nodes.length;
     dist = new Float64Array(c);
@@ -210,7 +278,7 @@ const POLICY = (() => {
     let exposure = 0, watchers = 0, opp = 0;
     for (let i = 0; i < foes.length; i++) {
       const e = foes[i];
-      if (!canSee(n.x, ey, n.z, e.pos.x, actorEye(e), e.pos.z)) continue;
+      if (!losClear(n.x, ey, n.z, e.pos.x, e.pos.y + 1.60, e.pos.z)) continue;
       watchers++;
       const d = Math.hypot(e.pos.x - n.x, e.pos.z - n.z);
       /* THREAT: an enemy that can see you but is 40 m away is not the same
